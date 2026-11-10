@@ -110,13 +110,19 @@ $DSH_HOME/../../backend/logs/backend-*.log.err   # 具体位置取决于你的�
 
 ## 安装
 
-还没发到 npm，直接从 git 装：
+```bash
+dsh plugin --profile <你的 profile> add dsh-alice-memory-llm
+```
+
+国内网络加个镜像会快很多：`--registry https://registry.npmmirror.com`。
+
+**不想走 npm，也可以从 git 装**（要求 GitHub 直连可达）：
 
 ```bash
 dsh plugin --profile <你的 profile> add github:cycocyco/alice-memory-llm
 ```
 
-想先看一遍代码，就链本地源码：
+**想先看一遍代码，就链本地源码**：
 
 ```bash
 git clone https://github.com/cycocyco/alice-memory-llm.git
