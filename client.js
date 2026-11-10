@@ -33,7 +33,7 @@ window.__ModuleLoader__.load({
     const FADE_MS = 450
 
     const CSS = `
-.alm-host{display:inline-flex;align-items:center;margin-inline-start:8px;flex:none;pointer-events:none}
+.alm-host{display:inline-flex;align-items:center;align-self:center;flex:none;pointer-events:none}
 .alm-pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;line-height:16px;font-weight:400;color:var(--dsw-alias-label-secondary,#cfd3d6);white-space:nowrap;user-select:none;opacity:1;transition:opacity ${FADE_MS}ms ease}
 .alm-pill[data-out="true"]{opacity:0}
 .alm-ring{box-sizing:border-box;flex:none;width:13px;height:13px;border-radius:50%;border:1.5px solid color-mix(in srgb, currentColor 28%, transparent);border-top-color:currentColor;animation:alm-spin 720ms linear infinite}
