@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Alice Memory · LLM Extraction",
+    "description": "Idle-batched distillation by your main chat model into one-line entries, recalled with hybrid vector + full-text search. Each extraction is one model call. Ships remember, recall and forget tools."
+  }
+}

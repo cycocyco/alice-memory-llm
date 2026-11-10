@@ -1,0 +1,57 @@
+{
+  "name": "dsh-alice-memory-llm",
+  "version": "1.0.0",
+  "description": "Long-term memory for DeepSeek Harness, LLM-extraction branch: idle-batched distillation by your main chat model, hybrid recall (vector + FTS5), explicit tools. Zero dependencies, Node only.",
+  "license": "MIT",
+  "type": "module",
+  "icon": "./icon.svg",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "bin": {
+    "alice-memory-llm": "./cli.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "cli.mjs",
+    "lib/",
+    "locale/",
+    "icon.svg",
+    "cordis.patch.yml",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "bench": "node --test test/ --test-name-pattern=bench"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "memory",
+    "llm",
+    "extraction",
+    "summarization",
+    "rag",
+    "sqlite",
+    "fts5",
+    "embedding"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cycocyco/alice-memory-llm.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
