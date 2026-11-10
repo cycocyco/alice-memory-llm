@@ -4,6 +4,21 @@
 
 主线继续走「逐条规则捕获、零模型调用」；本仓库把「什么值得记」交给主对话模型，代价是每次提炼一次模型调用。
 
+## 1.1.0 — 2026-11-10
+
+### 新增：提炼指示器（客户端半边）
+
+1.0.0 留了 `memory-capture:start / :success / :failed` 三个事件却没给 UI。这一版把它们接成了一个小指示器：
+
+- `lib/status.mjs`：进程内状态广播 + `GET /alice-memory-llm/status`（SSE，只认 loopback）。连上来先发当前快照；正在 `working` 的那一帧超过 5 分钟主动作废，避免宿主崩溃留下永久转圈；`success` / `failed` 广播 6 秒后自动落回 `idle`，晚打开的页面不会再看见一轮绿圈。
+- `client.js`：客户端插件（`dsh.client.platform = web`），注册到 `conversation.session.header.utilities` 插槽，再把 DOM portal 进 View 标签行，排在「更多视图」后面——就是会话头部那片空白。
+- 表现：提炼中 = 转圈 + 「记忆生成中...」；成功 = 圈变绿、字消失、停 1 秒渐隐；失败 = 不变绿、不报错、不通知，直接渐隐；平时不渲染任何节点。
+- 没有 `webServer` 的载体（桌面版）自动跳过这条路由，其余行为不变。
+
+### 变了：pool 多一个 `onEvent`
+
+`createCapturePool` 新增可选 `onEvent(kind, payload)`，与原有 `ctx.emit` 并行触发，让 UI 状态不必依赖 Cordis 事件名注册。原有调用方不受影响。
+
 ## 1.0.0 — 2026-11-10
 
 首个支线版本。数据格式与主线 v3.0.0 兼容，共用同一个数据目录。
