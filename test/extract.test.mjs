@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { Store } from '../lib/store.mjs';
 import { VectorIndex } from '../lib/vector-index.mjs';
 import { FakeEmbedder } from '../lib/embedding.mjs';
-import { isWorthKeeping } from '../lib/capture.mjs';
+import { isWorthKeeping, truncateForPool } from '../lib/capture.mjs';
 import { localDate } from '../lib/text.mjs';
 import {
   readHostProviders, resolveLlmConfig, buildPrompt, parseItems,
@@ -93,10 +93,10 @@ function mockFetch(items, { fail = false } = {}) {
   return { fn, calls };
 }
 
-function setup(dir, cfg, fetchImpl, env = {}) {
+function setup(dir, cfg, fetchImpl, env = {}, embedderOverride = null) {
   const store = openStore(dir);
   const index = new VectorIndex(8, { preferWorker: false });
-  const embedder = new FakeEmbedder(8);
+  const embedder = embedderOverride ?? new FakeEmbedder(8);
   const events = [];
   const ctx = { emit: (name, payload) => events.push({ name, ...payload }) };
   const pool = createCapturePool({
@@ -290,17 +290,59 @@ test('parseItems 兼容数组 / 对象包装 / 空数组，非法输出抛错', 
   assert.throws(() => parseItems('{"foo":1}'), /not an item array/);
 });
 
-test('buildPrompt 三段分隔，原文与已有记忆不混', () => {
+test('buildPrompt 只含原文与约束，已有记忆参考块不再进提示词', () => {
   const [system, user] = buildPrompt({
     turns: [{ turnId: 11, role: 'user', text: '我以后都用 TypeScript' }],
-    existing: ['用户偏好两个空格缩进'],
   });
   assert.match(system.content, /只依据/);
+  assert.match(system.content, /向量判重/);
   assert.match(user.content, /【本次待提炼的对话原文】/);
-  assert.match(user.content, /【已有记忆（仅供参考/);
   assert.match(user.content, /【禁止提取清单】/);
-  assert.ok(user.content.indexOf('turn 11') < user.content.indexOf('【已有记忆'));
+  assert.doesNotMatch(user.content, /【已有记忆/);
+  assert.match(user.content, /turn 11/);
   assert.match(user.content, /\[\]/);
+});
+
+// ---------- 入池截断：助手长回复与长贴日志不再整段进提炼 prompt ----------
+
+test('入池截断：user 500 / assistant 200，超长补省略号，数字配置两角色同限', () => {
+  const cfg = makeCfg('x');
+  const t = truncateForPool({ text: '用'.repeat(600), role: 'user', cfg });
+  assert.equal(t.length, 501);
+  assert.ok(t.endsWith('…'));
+  const a = truncateForPool({ text: '好'.repeat(300), role: 'assistant', cfg });
+  assert.equal(a.length, 201);
+  assert.ok(a.endsWith('…'));
+  const short = truncateForPool({ text: '短内容原样保留', role: 'user', cfg });
+  assert.equal(short, '短内容原样保留');
+  const num = makeCfg('x', { capture: { max_turn_chars: 80 } });
+  assert.equal(truncateForPool({ text: '长'.repeat(120), role: 'assistant', cfg: num }).length, 81);
+});
+
+test('提炼请求里的原文按角色截断：300 字的助手回复不再整段进 prompt', async () => {
+  const { dir, cleanup } = tmp();
+  try {
+    writeSettings(dir);
+    const cfg = makeCfg(dir);
+    const mock = mockFetch([]);
+    const s = setup(dir, cfg, mock.fn, { MAGPIE_GATEWAY_KEY: 'k' });
+    try {
+      s.pool.beginTurn();
+      s.pool.onMessage('assistant', '好'.repeat(300));
+      s.pool.onMessage('user', '我以后都用 TypeScript，不喜欢 any');
+      s.pool.completeTurn();
+      await wait(120);
+      assert.equal(mock.calls.length, 1);
+      const prompt = mock.calls[0].body.messages[1].content;
+      assert.ok(prompt.includes('…'), '截断处补省略号');
+      assert.ok(!prompt.includes('好'.repeat(250)), '长回复没有整段进 prompt');
+      assert.ok(prompt.includes('我以后都用 TypeScript，不喜欢 any'), '用户原文完整保留');
+    } finally {
+      s.cleanup();
+    }
+  } finally {
+    cleanup();
+  }
 });
 
 // ---------- 验收 6：WAL + busy_timeout ----------
@@ -486,6 +528,106 @@ test('3 轮含明确偏好，触发后库里 1 条 type=preference', async () =>
       assert.equal(row[0].memory_type, 'preference');
       assert.equal(row[0].content, PREF.content);
       assert.equal(s.events.filter((e) => e.name === 'memory-capture:success').at(-1).count, 1);
+    } finally {
+      s.cleanup();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------- 向量判重闸：端到端 ----------
+
+const unitVec = (i) => {
+  const v = new Float32Array(8);
+  v[i] = 1;
+  return v;
+};
+/** e_i 与 e_j 方向拼出指定余弦的向量（i⊥j 时成立） */
+const mixVec = (i, j, cos) => {
+  const v = new Float32Array(8);
+  v[i] = cos;
+  v[j] = Math.sqrt(1 - cos * cos);
+  return v;
+};
+
+test('端到端判重：库里同类记忆超量，提炼照跑但 0 条入库，游标照常推进', async () => {
+  const { dir, cleanup } = tmp();
+  try {
+    writeSettings(dir);
+    const cfg = makeCfg(dir);
+    const env = { MAGPIE_GATEWAY_KEY: 'k' };
+    const CAND = '这个话题又被提了一遍';
+    const mock = mockFetch([{ content: CAND, type: 'fact', confidence: 0.8, sourceTurnIds: [1] }]);
+    // 库里先有 4 条与候选向量夹角 0.8 的记忆（0.8 ≥ floor 0.75，4 > similar_max 3）
+    const bank = mixVec(0, 1, 0.8);
+    const embedder = {
+      ready: true,
+      async embedDocs(texts) {
+        return { ok: true, vectors: texts.map((t) => (t === CAND ? unitVec(0) : bank)) };
+      },
+    };
+    const s = setup(dir, cfg, mock.fn, env, embedder);
+    try {
+      const seeded = commitExtraction({
+        store: s.store,
+        items: [1, 2, 3, 4].map((i) => ({
+          content: `同类记忆第 ${i} 条`, type: 'fact', confidence: 0.8, sourceTurnIds: [],
+        })),
+        maxTurnId: 0,
+        memoryCfg: cfg.memory,
+      });
+      assert.equal(seeded.inserted.length, 4);
+      for (const id of seeded.inserted) s.index.set(id, bank);
+
+      s.pool.beginTurn();
+      s.pool.onMessage('user', '又聊到这个话题的一些内容');
+      s.pool.completeTurn();
+      await wait(120);
+      assert.equal(mock.calls.length, 1, '提炼请求照发');
+      assert.equal(s.store.countAll(), 4, '候选被饱和规则拦下，没有重复入库');
+      assert.equal(cursor(s.store), 1, '游标照常推进，不会反复重提');
+      assert.equal(
+        s.events.filter((e) => e.name === 'memory-capture:success').at(-1).count,
+        0,
+      );
+    } finally {
+      s.cleanup();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test('端到端判重：无关新偏好正常入库，闸不误伤', async () => {
+  const { dir, cleanup } = tmp();
+  try {
+    writeSettings(dir);
+    const cfg = makeCfg(dir);
+    const env = { MAGPIE_GATEWAY_KEY: 'k' };
+    const mock = mockFetch([PREF]);
+    const embedder = {
+      ready: true,
+      async embedDocs(texts) {
+        return { ok: true, vectors: texts.map((t) => (t === PREF.content ? unitVec(5) : unitVec(0))) };
+      },
+    };
+    const s = setup(dir, cfg, mock.fn, env, embedder);
+    try {
+      const seeded = commitExtraction({
+        store: s.store,
+        items: [{ content: '无关的旧记忆', type: 'fact', confidence: 0.8, sourceTurnIds: [] }],
+        maxTurnId: 0,
+        memoryCfg: cfg.memory,
+      });
+      s.index.set(seeded.inserted[0], unitVec(0));
+
+      s.pool.beginTurn();
+      s.pool.onMessage('user', '我以后都用 TypeScript，不喜欢 any');
+      s.pool.completeTurn();
+      await wait(120);
+      assert.equal(s.store.countAll(), 2, '新偏好与库内记忆正交，放行入库');
+      assert.equal(cursor(s.store), 1);
     } finally {
       s.cleanup();
     }

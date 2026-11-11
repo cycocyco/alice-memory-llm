@@ -5,7 +5,9 @@
     "优先级：环境变量 > config.local.json > config.json > 内置默认值。",
     "api_key 建议留空，改为在 DSH_HOME/.env 里写 SILICONFLOW_API_KEY（或下面 api_key_env 指定的变量名）。",
     "capture 段是本支线独有的：idleMs 是静默多久触发提炼，model=inherit 表示跟随主对话模型，",
-    "maxDailyExtractions 是每天最多调几次模型（失败也算一次）。这三个都会直接决定花多少钱。"
+    "maxDailyExtractions 是每天最多调几次模型（失败也算一次）。这三个都会直接决定花多少钱。",
+    "max_turn_chars 截断入池原文（user/assistant 分角色），dedup 在入库前做向量判重，",
+    "近重复与同话题超量（similar_max）都不进库——省的是提炼 prompt 的 token，参考块整个不发了。"
   ],
   "data_dir": "",
   "scope_id": "default",
@@ -39,10 +41,12 @@
   },
   "capture": {
     "enabled": true,
-    "idleMs": 300000,
+    "idleMs": 600000,
     "model": "inherit",
     "maxDailyExtractions": 50,
-    "embed_retry_minutes": 5
+    "embed_retry_minutes": 5,
+    "max_turn_chars": { "user": 500, "assistant": 200 },
+    "dedup": { "enabled": true, "near_dup": 0.9, "similar_floor": 0.75, "similar_max": 3 }
   },
   "memory": {
     "_note": "分层容量是硬约束：只有 hot + warm 常驻内存参与每轮扫描，cold 留在磁盘上按需唤醒。",

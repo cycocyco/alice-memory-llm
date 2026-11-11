@@ -28,8 +28,10 @@
 
 一次提炼的用量大致是：
 
-- **输入**：固定指令约 500 token + 本次待提炼的对话原文（截断到 1500 字符）+ 已有记忆参考（最多 5 条、每条 200 字符）
+- **输入**：固定指令约 400 token + 本次待提炼的对话原文（每轮截断：用户 500 字、助手 200 字，`capture.max_turn_chars` 可调）
 - **输出**：上限 `max_tokens` 2048，实际通常只有两三百 token
+
+已有记忆不进提炼提示词——与库内是否重复由入库前的向量判重裁决（见下文「向量判重」），所以这笔输入不随记忆库变大而变贵。
 
 按你主模型的价目表乘一下就知道多少钱。**插件不预估、不代付、不兜底**——费用直接记在你 `settings.yaml` 里那个 provider 的账上。
 
@@ -78,7 +80,7 @@ extract    cursor 3  |  today 1/50  |  entries 4
 embedding  BAAI/bge-m3 @ https://... (key ok)
 ```
 
-`cursor (none yet...)` 不算故障——说明还没有「一轮对话结束 + 静默满 `idleMs`」的完整窗口。安静五分钟再看。
+`cursor (none yet...)` 不算故障——说明还没有「一轮对话结束 + 静默满 `idleMs`」的完整窗口。安静十分钟再看。
 
 真出问题就看后端 stderr，插件所有日志都带 `[alice-memory-llm]` 前缀：
 
@@ -155,7 +157,7 @@ dsh plugin --profile web add file:/absolute/path/to/alice-memory-llm
   // ↓ 这一块是本支线独有的
   "capture": {
     "enabled": true,
-    "idleMs": 300000,                // 静默多久算空闲，默认 5 分钟
+    "idleMs": 600000,                // 静默多久算空闲，默认 10 分钟
     "model": "inherit",              // inherit = 跟随主对话；也可写具体模型名
     "maxDailyExtractions": 50        // 每天最多调几次模型
   },
@@ -193,13 +195,13 @@ dsh plugin --profile web add file:/absolute/path/to/alice-memory-llm
         ↓
   一轮对话结束 → 起 5 分钟闲置计时（每条新消息都会重置）
         ↓
-  静默满 idleMs → 取 turnId > lastProcessedTurnId 的已完成轮次
+  静默满 idleMs → 取 turnId > lastProcessedTurnId 的已完成轮次（原文按角色截断入池）
         ↓
-  用现有召回机制取回相关已有记忆，作为「已有记忆」参考块
-        ↓
-  LLM 提炼（复用主对话模型，独立请求，三段式 prompt）
+  LLM 提炼（复用主对话模型，独立请求，prompt 只含原文与约束）
         ↓
   结构化条目数组（可以是空数组）
+        ↓
+  向量判重：近重复 / 同话题超量（similar_max）不进库；embedding 挂了放行
         ↓
   SQLite 单事务：写条目 + 推进游标 + 记一次提炼（全成功才提交）
         ↓
@@ -211,10 +213,10 @@ dsh plugin --profile web add file:/absolute/path/to/alice-memory-llm
 几个刻意的设计决定：
 
 - **只处理已完成的轮次。** assistant 还在生成时到点触发，不会截断，那一轮留到下次。
-- **失败静默重试，游标不动。** 断网、超时、JSON 解析失败、DB 报错，一律回滚，下次空闲自动重提。失败也计一次额度，否则解析一直失败就会每 5 分钟重试到天亮。
+- **失败静默重试，游标不动。** 断网、超时、JSON 解析失败、DB 报错，一律回滚，下次空闲自动重提。失败也计一次额度，否则解析一直失败就会每 10 分钟重试到天亮。
 - **空数组是合法输出。** 没值得记的就 `[]`，照样推进游标、照样报 `count=0`，不硬凑。
 - **只存条目，不存原文。** 池里的原文不落盘，进程一崩就丢，接受这个损失，不做启动补提，也不做崩溃恢复。
-- **不做语义去重。** 只保留 `content` 的 sha256 完全一致跳过。prompt 里会让模型参考已有记忆别重复输出，但那是软约束；措辞一变就会进两条，重复、过时、错误由你自己开库清理。
+- **向量判重在入库前，不在提示词里。** 提炼结果先算向量（入库本来就要算的），与热区/温区索引比对：top1 相似度 ≥ `near_dup` 判近重复跳过；相似度 ≥ `similar_floor` 的条数 > `similar_max` 视为该话题已被反复记过，不再进；同批内换说法的重复也只留第一条。embedding 挂了整道闸放行（fail-open）——判重是省钱优化，不能变成丢记忆的闸门。措辞一变的重复现在拦得住；重复、过时、错误的清理仍由你自己开库做。
 - **没有串行队列。** 提炼请求走独立通道，绝不跟主对话请求排队。
 
 ### 提炼指示器（只在 web GUI 里有）
@@ -236,15 +238,12 @@ dsh plugin --profile web add file:/absolute/path/to/alice-memory-llm
 
 ### prompt 结构
 
-三段式，明确分隔，防止模型把参考块当成新料提取：
+只有原文与约束，没有参考块——与库内是否重复交给向量判重裁决，提示词不随记忆库变大：
 
 ```
 【本次待提炼的对话原文】
 turn 11 [user]: ...
 turn 11 [assistant]: ...
-
-【已有记忆（仅供参考，已覆盖的内容不要重复提取）】
-- 用户偏好 ...
 
 【禁止提取清单】
 - 寒暄、应答词、追问、纯问句、情绪表达
@@ -383,7 +382,8 @@ lib/recall.mjs          召回 + 超时降级
 lib/heat.mjs            热度与分层
 lib/capture.mjs         粗筛规则 + 向量 backfill
 lib/pool.mjs            待提炼池、空闲 debounce、flush 编排
-lib/extractor.mjs       主模型连接解析、三段式 prompt、JSON 解析
+lib/extractor.mjs       主模型连接解析、提炼 prompt（原文+约束）、JSON 解析
+lib/dedup.mjs           入库前向量判重：近重复 / 同话题超量不进库，fail-open
 lib/extraction-store.mjs 单事务写条目 + 游标 + 每日计数
 ```
 
