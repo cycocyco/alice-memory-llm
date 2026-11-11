@@ -25,7 +25,6 @@ import { loadIndex, runBackfill } from './lib/capture.mjs';
 import { recallForPrompt } from './lib/recall.mjs';
 import { remember, forget, prunePreview, pruneApply } from './lib/ops.mjs';
 import { createCapturePool } from './lib/pool.mjs';
-import { createCaptureStatus, STATUS_ROUTE } from './lib/status.mjs';
 
 export const name = 'alice-memory-llm';
 export const inject = ['tools'];
@@ -57,31 +56,12 @@ export function apply(ctx, config) {
   });
   const index = new VectorIndex(cfg.embedding.dimensions);
   const embedder = new HttpEmbedder(cfg.embedding, { logger });
-  // UI 指示器的状态源：只活在内存里，浏览器连上来才看得到。
-  const status = createCaptureStatus({ logger });
   const pool = createCapturePool({
     store, index, embedder, cfg, logger, ctx,
     onInserted: () => { void backfillNow(); },
-    onEvent: (kind, payload) => {
-      if (kind === 'start') status.set('working', { turns: payload?.turns ?? 0 });
-      else if (kind === 'success') status.set('success', { count: payload?.count ?? 0 });
-      else if (kind === 'failed') status.set('failed'); // 失败不解释，UI 也不做红字
-    },
   });
 
   const injected = new Map();   // sessionId -> Set(ids) 本轮已注入
-
-  // 浏览器载体：只有 web 组合才挂 webServer（桌面版走 file:// + IPC，没有这条路）。
-  // 没有载体时一切都照常，只是没人能看到那个小转圈。
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['webServer'], (web) => {
-      web.effect(() => web.webServer.register({
-        kind: 'exact',
-        path: STATUS_ROUTE,
-        handler: (req, res) => { status.serve(req, res); },
-      }), 'alice-memory-llm: capture status route');
-    });
-  }
 
   let disposed = false;
   let sweeping = false;
@@ -147,7 +127,6 @@ export function apply(ctx, config) {
       clearTimeout(loadTimer);
       clearInterval(sweepTimer);
       clearInterval(backfillTimer);
-      try { status.dispose(); } catch {}
       try { pool.dispose(); } catch {}
       try { store.close(); } catch {}
       try { await index.close(); } catch {}

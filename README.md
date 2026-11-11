@@ -11,7 +11,7 @@
 
 零第三方依赖，纯 Node（`node:sqlite`），不需要 Python、不需要额外数据库服务。
 
-> **测试基线**：开发与验证全部在 **npm 方式安装的 DSH** 上完成（`npm i -g @deepseek-ai/dsh`，浏览器打开 `dsh web` 的 GUI）。**Electron 桌面版没有测过，不保证能用。** 会话头部那个提炼指示器尤其依赖 npm 版才有的 `webServer` 载体；桌面版走 `file://` + IPC，没有这条 HTTP 路由，指示器会自行降级成「不显示」，其它功能不受影响。
+> **测试基线**：开发与验证全部在 **npm 方式安装的 DSH** 上完成（`npm i -g @deepseek-ai/dsh`，浏览器打开 `dsh web` 的 GUI）。**Electron 桌面版没有测过，不保证能用。**
 
 ---
 
@@ -205,9 +205,7 @@ dsh plugin --profile web add file:/absolute/path/to/alice-memory-llm
         ↓
   SQLite 单事务：写条目 + 推进游标 + 记一次提炼（全成功才提交）
         ↓
-  发状态事件 memory-capture:start / :success / :failed
-        ↓
-  web GUI 会话头部的小指示器跟着转 / 变绿 / 自己消失
+  发状态事件 memory-capture:start / :success / :failed（Cordis 事件，仅供宿主侧订阅）
 ```
 
 几个刻意的设计决定：
@@ -218,23 +216,6 @@ dsh plugin --profile web add file:/absolute/path/to/alice-memory-llm
 - **只存条目，不存原文。** 池里的原文不落盘，进程一崩就丢，接受这个损失，不做启动补提，也不做崩溃恢复。
 - **向量判重在入库前，不在提示词里。** 提炼结果先算向量（入库本来就要算的），与热区/温区索引比对：top1 相似度 ≥ `near_dup` 判近重复跳过；相似度 ≥ `similar_floor` 的条数 > `similar_max` 视为该话题已被反复记过，不再进；同批内换说法的重复也只留第一条。embedding 挂了整道闸放行（fail-open）——判重是省钱优化，不能变成丢记忆的闸门。措辞一变的重复现在拦得住；重复、过时、错误的清理仍由你自己开库做。
 - **没有串行队列。** 提炼请求走独立通道，绝不跟主对话请求排队。
-
-### 提炼指示器（只在 web GUI 里有）
-
-提炼是后台动作，用户看不见它在忙。所以插件带了一个客户端半边，在会话头部的 View 标签行右侧显示一个小转圈：
-
-| 时刻 | 样子 |
-| --- | --- |
-| 提炼开始 | 转圈 + 小字「记忆生成中...」 |
-| 提炼成功 | 小字消失，圈变绿，停 1 秒后渐隐 |
-| 提炼失败 | 什么都不说：圈不变绿、不报红、不弹通知，直接渐隐 |
-| 平时 | 不存在，页面上一点痕迹都没有 |
-
-链路很短：宿主半侧在提炼事件上把状态推给自己的一条 SSE 路由 `GET /alice-memory-llm/status`（只认 loopback，`text/event-stream`，连上来先收一份当前快照），浏览器半侧 `client.js` 订阅它。状态只在内存里，进程重启后必然从 idle 开始。
-
-位置不是随便挑的：会话头部内核只给了 `conversation.session.header.utilities` 插槽（标题行右端），而 View 标签行没有插槽。所以客户端把宿主元素插进 `[data-conversation-tabs]` 的父节点、排在「更多视图」按钮之后；单视图会话没有标签行时退回插槽内联。没有 webServer 的载体（桌面版 `file://` + IPC）自动降级成「没有这个 UI」，其它功能一律照旧。
-
-失败为什么不留痕？记忆提炼是可重试的后台动作，失败会自动重提；把失败做成红色提示只会制造焦虑，而用户对这件事本来无能为力。
 
 ### prompt 结构
 

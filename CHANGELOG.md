@@ -4,6 +4,18 @@
 
 主线继续走「逐条规则捕获、零模型调用」；本仓库把「什么值得记」交给主对话模型，代价是每次提炼一次模型调用。
 
+## 1.3.0 — 2026-11-12
+
+### 删了：提炼指示器
+
+用下来的结论是它几乎没有被看见过——触发都发生在空闲期，盯着屏幕的人等不到它转。整个客户端半边下线：
+
+- 删除 `client.js`（浏览器侧 DOM 指示器）与 `lib/status.mjs`（SSE 路由 `GET /alice-memory-llm/status`），`package.json` 相应去掉 `./client` 导出、`files` 条目和 `dsh.client` 声明。
+- `index.mjs` 摘掉 webServer 路由注册与 `onEvent` 接线；`createCapturePool` 移除可选 `onEvent` 参数。
+- 保留 Cordis 事件 `memory-capture:start / :success / :failed`（宿主侧仍可自行订阅，测试也靠它验收）。
+
+提炼行为本身零变化。测试 53 项全绿（撤掉指示器相关 9 项）。
+
 ## 1.2.0 — 2026-11-11
 
 ### 变了：提炼成本瘦身——入池截断 + 判重搬家
