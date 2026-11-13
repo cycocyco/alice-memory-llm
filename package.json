@@ -1,6 +1,6 @@
 {
   "name": "dsh-alice-memory-llm",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Long-term memory for DeepSeek Harness, LLM-extraction branch: idle-batched distillation by your main chat model, hybrid recall (vector + FTS5), explicit tools. Zero dependencies, Node only.",
   "license": "MIT",
   "type": "module",
@@ -23,6 +23,8 @@
     "cordis.patch.yml",
     "config.example.json",
     "README.md",
+    "TIDY.md",
+    "ARCHITECTURE.md",
     "LICENSE"
   ],
   "engines": {

@@ -23,7 +23,8 @@ import { VectorIndex } from './lib/vector-index.mjs';
 import { HttpEmbedder } from './lib/embedding.mjs';
 import { loadIndex, runBackfill } from './lib/capture.mjs';
 import { recallForPrompt } from './lib/recall.mjs';
-import { remember, forget, prunePreview, pruneApply } from './lib/ops.mjs';
+import { remember, forget, prunePreview, pruneApply, listEntries, forgetMany, mergeMemories } from './lib/ops.mjs';
+import { tidyScan, writeAnchor } from './lib/tidy.mjs';
 import { createCapturePool } from './lib/pool.mjs';
 
 export const name = 'alice-memory-llm';
@@ -294,13 +295,14 @@ export function apply(ctx, config) {
   ctx.tools.register({
     name: 'alice_memory_forget',
     description:
-      '删除记忆条目及其向量。用户说「删掉关于 X 的记忆」「忘掉这条」时调用。给 id 精确删；给 query 按关键词删。',
+      '删除记忆条目及其向量。用户说「删掉关于 X 的记忆」「忘掉这条」时调用。给 id 精确删；给 query 按关键词删（默认只列命中，需 confirm 才真删）。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         id: { type: 'string', description: '记忆 id。' },
-        query: { type: 'string', description: '关键词，至少两个字；多条命中会一起删。' },
+        query: { type: 'string', description: '关键词，至少两个字。默认只列命中不删，需再带 confirm。' },
+        confirm: { type: 'boolean', description: '配合 query 使用；确认命中项全部要删时才置 true。' },
       },
     },
     output: {
@@ -324,8 +326,16 @@ export function apply(ctx, config) {
       const id = typeof args?.id === 'string' ? args.id.trim() : '';
       const query = typeof args?.query === 'string' ? args.query.trim() : '';
       if (!id && !query) throw new Error('id 和 query 至少给一个');
-      const res = forget({ store, index, cfg, id, query });
+      const res = forget({ store, index, cfg, id, query, confirm: args?.confirm === true });
       if (!res.ok) return res;
+      if (res.pendingConfirm) {
+        const detail = res.events.map((e) => `· ${e.content}`).join('\n');
+        return {
+          ok: false,
+          removed: 0,
+          summary: `关键词命中 ${res.events.length} 条，还没删。看清楚再决定：\n${detail}\n\n确认要全删就带 confirm=true 再调一次；只想删其中几条，改用 alice_memory_tidy 的 delete。`,
+        };
+      }
       const detail = res.events.map((e) => `· ${e.content}`).join('\n');
       return {
         ok: true,
@@ -403,6 +413,163 @@ export function apply(ctx, config) {
           ? `有 ${out.total} 条冷记忆超过 ${days} 天没被用过，合计 ${(out.bytes / 1024).toFixed(1)} KB：\n${sample}\n\n要顺手带走吗？点头我就删（token ${out.token}）。`
           : `没有超过 ${days} 天没被用过的冷记忆，库很干净。`,
       };
+    },
+  });
+
+  // 整理记忆库：一个入口三个动作。默认全部只出 diff，apply 才落地。
+  ctx.tools.register({
+    name: 'alice_memory_tidy',
+    description:
+      '整理长期记忆库。用户说「整理记忆」「清理记忆库」「合并重复的记忆」时用。' +
+      'action=scan 出候选（重复簇 / 空壳 / 久未用），action=delete 按 id 批删，action=merge 把多条并成一条新总结。' +
+      '默认只出 diff 不动手，确认后带 apply=true。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['scan', 'list', 'delete', 'merge'], description: '要做的事。' },
+        apply: { type: 'boolean', description: '真正落地；不传则只预览。' },
+        ids: { type: 'array', items: { type: 'string' }, description: 'delete / merge 的目标 id。' },
+        content: { type: 'string', description: 'merge 时新写的总结正文。' },
+        since: { type: 'string', description: 'scan 的增量起点（ISO 时间）；缺省读上次整理的锚点。' },
+        keyword: { type: 'string', description: 'list 时按关键词过滤。' },
+        tier: { type: 'string', enum: ['hot', 'warm', 'cold', 'archive'], description: 'list 时按分层过滤。' },
+        limit: { type: 'integer', description: 'list 每页条数，默认 50。' },
+        offset: { type: 'integer', description: 'list 翻页偏移。' },
+        threshold: { type: 'number', description: 'scan 的自动合并阈值，默认 0.92。' },
+        lower: { type: 'number', description: 'scan 的候选阈值，默认 0.78。' },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          applied: { type: 'boolean' },
+          summary: { type: 'string' },
+          error: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      render(_args, v) {
+        if (!v.ok) return textBlock(`整理失败：${v.error ?? '未知错误'}`);
+        return textBlock(v.summary ?? '');
+      },
+    },
+    async execute(args) {
+      const action = typeof args?.action === 'string' ? args.action : 'scan';
+      const apply = args?.apply === true;
+
+      if (action === 'list') {
+        const out = listEntries({
+          store,
+          keyword: typeof args?.keyword === 'string' ? args.keyword : '',
+          tier: typeof args?.tier === 'string' ? args.tier : '',
+          limit: Number.isInteger(args?.limit) ? args.limit : 50,
+          offset: Number.isInteger(args?.offset) ? args.offset : 0,
+        });
+        const body = out.items
+          .map((i) => `· ${i.id} [${i.date}]${i.pinned ? ' 📌' : ''} ${i.content}`)
+          .join('\n');
+        return {
+          ok: true,
+          action,
+          applied: false,
+          summary: out.total
+            ? `共 ${out.total} 条，这页 ${out.count} 条${out.hasMore ? '（还有下一页）' : ''}：\n${body}`
+            : '没有符合条件的条目。',
+        };
+      }
+
+      if (action === 'scan') {
+        const out = tidyScan({
+          store,
+          since: typeof args?.since === 'string' ? args.since : '',
+          threshold: Number.isFinite(args?.threshold) ? Number(args.threshold) : 0.92,
+          lower: Number.isFinite(args?.lower) ? Number(args.lower) : 0.78,
+        });
+        const lines = [];
+        const w = out.window;
+        lines.push(`窗口 ${w.since ? `自 ${w.since}` : '全库'}，扫 ${w.count}/${w.total} 条`);
+        lines.push(
+          `空壳 ${out.summary.shells} · 重复候选 ${out.summary.clusters} 组（其中自动档 ${out.summary.autoClusters} 组）· 久未用 ${out.summary.stale}`,
+        );
+        if (out.shells.length) {
+          lines.push('\n【空壳，可直接删】');
+          for (const s of out.shells) lines.push(`· ${s.id} [${s.date}] ${s.content}`);
+        }
+        if (out.clusters.length) {
+          lines.push('\n【重复候选，需你判断能否合并】');
+          for (const g of out.clusters) {
+            lines.push(`${g.auto ? '★自动档' : '候选'} 相似度 ${g.minScore}，${g.size} 条：`);
+            for (const m of g.members) lines.push(`   · ${m.id} [${m.date}]${m.pinned ? ' 📌' : ''} ${m.content}`);
+          }
+        }
+        if (out.stale.length) {
+          lines.push('\n【久未用】');
+          for (const s of out.stale.slice(0, 10)) lines.push(`· ${s.id} ${s.days ?? '?'}天 ${s.content}`);
+        }
+        return { ok: true, action, applied: false, summary: lines.join('\n') };
+      }
+
+      if (action === 'delete') {
+        const ids = Array.isArray(args?.ids) ? args.ids.filter((x) => typeof x === 'string') : [];
+        if (!ids.length) return { ok: false, error: 'delete 需要 ids' };
+        if (!apply) {
+          const found = ids.map((id) => store.getMemory(id)).filter(Boolean);
+          const body = found.map((r) => `· ${r.id} [${r.local_date}] ${String(r.content).slice(0, 80)}`).join('\n');
+          return {
+            ok: true,
+            action,
+            applied: false,
+            summary: found.length
+              ? `将删除 ${found.length} 条（还没动）：\n${body}\n\n确认后带 apply=true。`
+              : '这些 id 在库里都不存在。',
+          };
+        }
+        const out = forgetMany({ store, index, ids });
+        writeAnchor({ store });
+        return {
+          ok: true,
+          action,
+          applied: true,
+          summary: `已删除 ${out.removed} 条，正文和向量一起清。`,
+        };
+      }
+
+      if (action === 'merge') {
+        const ids = Array.isArray(args?.ids) ? args.ids.filter((x) => typeof x === 'string') : [];
+        const content = typeof args?.content === 'string' ? args.content : '';
+        if (ids.length < 2) return { ok: false, error: 'merge 至少需要两个 ids' };
+        const out = await mergeMemories({
+          store, index, embedder, cfg, logger,
+          ids, content, dryRun: !apply || !content,
+        });
+        if (!out.ok) return { ok: false, error: out.error };
+        if (out.dryRun) {
+          const body = out.sources.map((s) => `· ${s.id} [${s.date}] ${s.content}`).join('\n');
+          return {
+            ok: true,
+            action,
+            applied: false,
+            summary: content
+              ? `将合并这 ${out.sources.length} 条并删掉源条目（还没动）：\n${body}\n\n确认后带 apply=true。`
+              : `将合并这 ${out.sources.length} 条，但还缺合并后的正文 content：\n${body}`,
+          };
+        }
+        writeAnchor({ store });
+        return {
+          ok: true,
+          action,
+          applied: true,
+          summary: `合并完成：新条目 ${out.id}，删掉 ${out.removed} 条源条目${out.vector ? '，向量已生成' : '，向量待补'}。`,
+        };
+      }
+
+      return { ok: false, error: `未知 action: ${action}` };
     },
   });
 }

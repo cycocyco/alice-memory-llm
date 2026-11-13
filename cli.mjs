@@ -4,7 +4,7 @@ import { existsSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadConfig } from './lib/config.mjs';
+import { loadConfig, embeddingReady } from './lib/config.mjs';
 import { DB_NAME, importFromPath, purgeStoreDir, scanStoreDirs } from './lib/migrate.mjs';
 import { createLogger } from './lib/logger.mjs';
 import { Store } from './lib/store.mjs';
@@ -12,7 +12,8 @@ import { VectorIndex } from './lib/vector-index.mjs';
 import { HttpEmbedder } from './lib/embedding.mjs';
 import { recallForPrompt } from './lib/recall.mjs';
 import { runBackfill, loadIndex } from './lib/capture.mjs';
-import { remember, forget, prunePreview, pruneApply } from './lib/ops.mjs';
+import { remember, forget, prunePreview, pruneApply, listEntries, mergeMemories } from './lib/ops.mjs';
+import { tidyScan, readAnchor, writeAnchor } from './lib/tidy.mjs';
 import { localDate } from './lib/text.mjs';
 import { ensureExtractionSchema } from './lib/extraction-store.mjs';
 
@@ -81,7 +82,14 @@ async function main() {
   status                       库概况（条数、分层、向量、待补）
   recall <query> [--limit n]   检索并打印命中
   remember <text> [--title t]  手动记一条
-  forget --id <id> | --query q 删一条/一批
+  list [--keyword k] [--tier t] [--since iso] [--limit n] [--offset n]
+                               分页翻条目（整理时用）
+  tidy [--since iso] [--threshold f] [--json]
+                               整理候选：重复簇 / 空壳 / 久未用（只读）
+  merge --ids a,b,c --content <总结> [--apply]
+                               合并：新写一条总结，删掉全部源条目
+  forget --id <id> | --ids a,b 按 id 删（精确）
+  forget --query q [--confirm] 按关键词删；默认只列命中，加 --confirm 才真删
   prune [--days 90] [--apply --token t]
   sweep                        立刻跑一次热度分层
   backfill                     补一次缺失的向量
@@ -103,7 +111,7 @@ async function main() {
       console.log(`memories   ${store.countAll()}  (hot ${tiers.hot} / warm ${tiers.warm} / cold ${tiers.cold} / archive ${tiers.archive})`);
       console.log(`vectors    ${store.countVectors()}  (pending ${pending})`);
       console.log(`tombstones ${store.countTombstones()}`);
-      console.log(`embedding  ${cfg.embedding.model} @ ${cfg.embedding.url} ${cfg.embedding.apiKey ? '(key ok)' : '(no key)'}`);
+      console.log(embeddingReady(cfg) ? `embedding  ${cfg.embedding.model} @ ${cfg.embedding.url} (key ok)` : 'embedding  未配置 —— 当前只走全文/关键词召回，向量通道关闭。填 embedding.url/model 和 key 即可开启语义召回');
       // 提炼层状态：游标是「已经处理到第几轮」，日计数用来核对当天花了多少次模型调用
       const cursorRow = store.meta('last_processed_turn_id');
       const today = localDate(new Date());
@@ -142,8 +150,93 @@ async function main() {
     }
 
     if (cmd === 'forget') {
-      const out = forget({ store, index, cfg, id: argv.id ?? '', query: argv.query ?? '' });
+      const out = forget({
+        store, index, cfg,
+        id: argv.id ?? '',
+        query: argv.query ?? '',
+        ids: listify(argv.ids).flatMap((s) => String(s).split(',')).map((s) => s.trim()).filter(Boolean),
+        confirm: argv.confirm === true,
+      });
       console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+
+    if (cmd === 'list') {
+      const out = listEntries({
+        store,
+        since: typeof argv.since === 'string' ? argv.since : '',
+        until: typeof argv.until === 'string' ? argv.until : '',
+        tier: typeof argv.tier === 'string' ? argv.tier : '',
+        keyword: typeof argv.keyword === 'string' ? argv.keyword : '',
+        limit: Number(argv.limit ?? 50),
+        offset: Number(argv.offset ?? 0),
+        order: typeof argv.order === 'string' ? argv.order : 'asc',
+      });
+      if (argv.json === true) {
+        console.log(JSON.stringify(out, null, 2));
+        return;
+      }
+      console.log(`共 ${out.total} 条，本页 ${out.count} 条，offset ${out.offset}${out.hasMore ? '（还有下一页）' : ''}`);
+      for (const i of out.items) {
+        console.log(`${i.id}  ${i.date}  ${i.tier.padEnd(6)} ${i.pinned ? '📌' : '  '} ${i.content}`);
+      }
+      return;
+    }
+
+    if (cmd === 'tidy') {
+      const out = tidyScan({
+        store,
+        since: typeof argv.since === 'string' ? argv.since : '',
+        threshold: argv.threshold === undefined ? 0.78 : Number(argv.threshold),
+        staleDays: Number(argv['stale-days'] ?? 180),
+        limit: Number(argv.limit ?? 3000),
+      });
+      if (argv.json === true) {
+        console.log(JSON.stringify(out, null, 2));
+        return;
+      }
+      console.log(`窗口 ${out.window.since ? `自 ${out.window.since}` : '全库'}，扫 ${out.window.count}/${out.window.total} 条`);
+      console.log(`空壳 ${out.summary.shells} · 重复候选 ${out.summary.clusters} 组 · 久未用 ${out.summary.stale}`);
+      if (out.shells.length) {
+        console.log('\n【空壳】');
+        for (const s of out.shells) console.log(`  ${s.id} ${s.date} ${s.content}`);
+      }
+      if (out.clusters.length) {
+        console.log('\n【重复候选】');
+        for (const g of out.clusters) {
+          console.log(`  候选 相似度 ${g.minScore} / ${g.size} 条`);
+          for (const m of g.members) console.log(`    ${m.id} ${m.date}${m.pinned ? ' 📌' : ' '} ${m.content}`);
+        }
+      }
+      if (out.stale.length) {
+        console.log('\n【久未用】');
+        for (const s of out.stale) console.log(`  ${s.id} ${s.days ?? '?'}天 ${s.content}`);
+      }
+      return;
+    }
+
+    if (cmd === 'merge') {
+      const ids = listify(argv.ids).flatMap((s) => String(s).split(',')).map((s) => s.trim()).filter(Boolean);
+      const content = typeof argv.content === 'string' ? argv.content : '';
+      const out = await mergeMemories({
+        store, index, embedder, cfg, logger,
+        ids, content,
+        title: typeof argv.title === 'string' ? argv.title : '',
+        dryRun: argv.apply !== true || !content,
+      });
+      console.log(JSON.stringify(out, null, 2));
+      if (out.ok && argv.apply === true && content) writeAnchor({ store });
+      return;
+    }
+
+    if (cmd === 'tidy-anchor') {
+      if (argv.set === true || typeof argv.set === 'string') {
+        const at = typeof argv.set === 'string' ? argv.set : new Date().toISOString();
+        writeAnchor({ store, at });
+        console.log(`anchor = ${at}`);
+      } else {
+        console.log(`anchor = ${readAnchor({ store }) || '(未设置，下次整理会扫全库)'}`);
+      }
       return;
     }
 
@@ -249,8 +342,14 @@ async function main() {
     if (cmd === 'doctor') {
       console.log(`node        ${process.version}`);
       console.log(`data_dir    ${cfg.dataDir} ${existsSync(cfg.dataDir) ? '' : '(will be created)'}`);
-      console.log(`embedding   ${cfg.embedding.url} ${cfg.embedding.model} dims=${cfg.embedding.dimensions}`);
-      console.log(`api key     ${cfg.embedding.apiKey ? 'ok' : 'MISSING — put ALICE_MEMORY_API_KEY or the var named by api_key_env into DSH_HOME/.env'}`);
+      const ready = embeddingReady(cfg);
+      console.log(`embedding   ${ready ? `${cfg.embedding.url} ${cfg.embedding.model} dims=${cfg.embedding.dimensions}` : '未配置（url / model / key 缺一）'}`);
+      console.log(`api key     ${ready ? 'ok' : `MISSING — 把 key 写进 DSH_HOME/.env 里 ${cfg.api_key_env} 那一行`}`);
+      if (!ready) {
+        console.log('probe       skipped —— 没配 embedding，召回会退化成纯全文/关键词检索');
+        console.log(`fts5        ${store.searchFts(['test'], 1) ? 'ok' : 'ok'}`);
+        return;
+      }
       const ping = await embedder.embedQuery('ping').catch((err) => ({ ok: false, error: String(err) }));
       console.log(`probe       ${ping.ok ? `ok (${ping.vectors?.[0]?.length ?? 0} dims)` : `failed: ${ping.error}`}`);
       console.log(`fts5        ${store.searchFts(['test'], 1) ? 'ok' : 'ok'}`);

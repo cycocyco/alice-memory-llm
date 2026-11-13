@@ -11,7 +11,8 @@ import { FakeEmbedder, hashVector } from '../lib/embedding.mjs';
 import { hybridSearch } from '../lib/search.mjs';
 import { isWorthKeeping, loadIndex } from '../lib/capture.mjs';
 import { recallForPrompt } from '../lib/recall.mjs';
-import { remember, forget, prunePreview, pruneApply } from '../lib/ops.mjs';
+import { remember, forget, prunePreview, pruneApply, listEntries, forgetMany, mergeMemories } from '../lib/ops.mjs';
+import { tidyScan, cosine, isShell, clusterBySimilarity, readAnchor, writeAnchor } from '../lib/tidy.mjs';
 import { localDate } from '../lib/text.mjs';
 import { importFromPath, purgeStoreDir } from '../lib/migrate.mjs';
 
@@ -221,7 +222,14 @@ test('remember / forget roundtrip', async () => {
     const dup = await remember({ store, index, embedder, cfg, text: '代理由本地 127.0.0.1:7890' });
     assert.equal(dup.deduped, true);
 
-    const gone = forget({ store, index, cfg, query: '7890' });
+    // query 是模糊匹配：默认只列命中，必须带 confirm 才真删
+    const bare = forget({ store, index, cfg, query: '7890' });
+    assert.equal(bare.removed, 0);
+    assert.equal(bare.pendingConfirm, true);
+    assert.equal(bare.events.length, 1);
+    assert.equal(store.countAll(), 1);
+
+    const gone = forget({ store, index, cfg, query: '7890', confirm: true });
     assert.equal(gone.removed, 1);
     assert.equal(store.countAll(), 0);
     assert.equal(store.countVectors(), 0);
@@ -370,5 +378,192 @@ test('scattered store imports into the unified library and purges cleanly', () =
     store.close();
     target.cleanup();
     source.cleanup();
+  }
+});
+
+// ---------- 整理：翻页 / 批删 / 合并 / 候选裁剪 ----------
+
+function seed(store, items) {
+  return items.map((it, i) => store.insertMemory({
+    kind: 'turn',
+    content: it.content,
+    userText: it.content,
+    scopeId: 'default',
+    source: it.source ?? 'auto',
+    importance: it.importance,
+    pinned: it.pinned,
+    occurredAt: new Date(Date.UTC(2026, 0, 1 + i)).toISOString(),
+    localDate: `2026-01-${String(1 + i).padStart(2, '0')}`,
+    embeddingStatus: 'pending',
+  }).id);
+}
+
+test('listEntries pages, filters and reports totals', () => {
+  const { dir, cleanup } = tmp();
+  const cfg = makeCfg(dir);
+  const store = openStore(dir, cfg);
+  try {
+    seed(store, [
+      { content: '关于代理端口 7890 的配置说明' },
+      { content: '关于知识库根目录在 F 盘的记录文档' },
+      { content: '关于知识库备份策略的另一条说明' },
+    ]);
+
+    const page1 = listEntries({ store, limit: 2, offset: 0 });
+    assert.equal(page1.total, 3);
+    assert.equal(page1.count, 2);
+    assert.equal(page1.hasMore, true);
+
+    const page2 = listEntries({ store, limit: 2, offset: 2 });
+    assert.equal(page2.count, 1);
+    assert.equal(page2.hasMore, false);
+
+    const hit = listEntries({ store, keyword: '知识库' });
+    assert.equal(hit.total, 2);
+
+    assert.equal(listEntries({ store, tier: 'cold' }).total, 0);
+  } finally {
+    store.close();
+    cleanup();
+  }
+});
+
+test('forgetMany removes a batch atomically and clears vectors', () => {
+  const { dir, cleanup } = tmp();
+  const cfg = makeCfg(dir);
+  const store = openStore(dir, cfg);
+  const index = new VectorIndex(cfg.embedding.dimensions, { preferWorker: false });
+  try {
+    const ids = seed(store, [
+      { content: '第一条要删除的记忆内容' },
+      { content: '第二条要删除的记忆内容' },
+      { content: '第三条要保留的记忆内容' },
+    ]);
+    for (const id of ids) store.setVector(id, hashVector('x' + id, cfg.embedding.dimensions), 'fake');
+    assert.equal(store.countVectors(), 3);
+
+    const out = forgetMany({ store, index, ids: [ids[0], ids[1], ids[0], 'mem-not-exist'] });
+    assert.equal(out.removed, 2);
+    assert.equal(store.countAll(), 1);
+    assert.equal(store.countVectors(), 1);
+    assert.equal(store.countTombstones(), 2);
+
+    // 空输入不该碰库
+    assert.equal(forgetMany({ store, index, ids: [] }).removed, 0);
+  } finally {
+    index.close();
+    store.close();
+    cleanup();
+  }
+});
+
+test('merge writes one new note and drops every source', async () => {
+  const { dir, cleanup } = tmp();
+  const cfg = makeCfg(dir);
+  const store = openStore(dir, cfg);
+  const index = new VectorIndex(cfg.embedding.dimensions, { preferWorker: false });
+  const embedder = new FakeEmbedder(cfg.embedding.dimensions);
+  try {
+    const ids = seed(store, [
+      { content: '代理端口是 7890，备用 7897' },
+      { content: '代理走本地 127.0.0.1，端口 7890' },
+      { content: '无关的第三方内容' },
+    ]);
+
+    // 少于两条不给合并
+    const bad = await mergeMemories({ store, index, embedder, cfg, ids: [ids[0]], content: 'x' });
+    assert.equal(bad.ok, false);
+
+    // dry-run 不写库
+    const dry = await mergeMemories({ store, index, embedder, cfg, ids: [ids[0], ids[1]], content: '合并正文', dryRun: true });
+    assert.equal(dry.ok, true);
+    assert.equal(dry.dryRun, true);
+    assert.equal(store.countAll(), 3);
+
+    const out = await mergeMemories({
+      store, index, embedder, cfg,
+      ids: [ids[0], ids[1]],
+      content: '本地代理指向 127.0.0.1:7890，备用 7897',
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.removed, 2);
+    assert.equal(store.countAll(), 2); // 1 条新 + 1 条无关的
+    assert.equal(store.countTombstones(), 2);
+
+    const merged = store.getMemory(out.id);
+    assert.match(merged.content, /7890/);
+    assert.equal(merged.source, 'merge');
+    assert.equal(merged.pinned, 1);
+    assert.equal(merged.embedding_status, 'ok');
+  } finally {
+    index.close();
+    store.close();
+    cleanup();
+  }
+});
+
+test('isShell only flags genuinely empty confirmations', () => {
+  const base = { pinned: 0, source: 'auto', importance: 1 };
+  assert.equal(isShell({ ...base, content: 'User: 弄好了吗\nAssistant: 弄好了' }), true);
+  assert.equal(isShell({ ...base, content: 'User: 好的' }), true);
+  assert.equal(isShell({ ...base, content: 'User: 嗯嗯' }), true);
+  // 有实质内容的不许碰
+  assert.equal(isShell({ ...base, content: 'User: 把代理端口改成 7890\nAssistant: 改好了，重启后生效' }), false);
+  // 手记的和 pinned 的一律不动
+  assert.equal(isShell({ ...base, pinned: 1, content: 'User: 好的' }), false);
+  assert.equal(isShell({ ...base, source: 'manual', content: 'User: 好的' }), false);
+});
+
+test('clusterBySimilarity groups duplicates and spares distinct rows', () => {
+  const v = (n) => Float32Array.from(n);
+  const vecs = [
+    { id: 'a', vec: v([1, 0, 0, 0]), chars: 10 },
+    { id: 'b', vec: v([0.99, 0.02, 0, 0]), chars: 20 }, // 与 a 近重复，字数更多
+    { id: 'c', vec: v([0, 1, 0, 0]), chars: 30 },
+    { id: 'd', vec: v([0, 0, 1, 0]), chars: 40 },
+  ];
+  const out = clusterBySimilarity({ vecs, threshold: 0.92 });
+  assert.equal(out.clusters.length, 1);
+  assert.equal(out.clusters[0].size, 2);
+  assert.equal(out.clusters[0].rep, 'b'); // 代表取字数最多的
+  assert.ok(out.clusters[0].minScore >= 0.92);
+
+  // 同一个簇在低阈值下也只是同一簇，不会把无关的连进来
+  const loose = clusterBySimilarity({ vecs, threshold: 0.5 });
+  assert.equal(loose.clusters.length, 1);
+
+  assert.equal(cosine(v([1, 0]), v([1, 0])), 1);
+  assert.equal(cosine(v([1, 0]), v([0, 1])), 0);
+  assert.equal(cosine(null, v([1, 0])), 0);
+});
+
+test('tidyScan separates auto tier from candidate tier', () => {
+  const { dir, cleanup } = tmp();
+  const cfg = makeCfg(dir);
+  const store = openStore(dir, cfg);
+  try {
+    const ids = seed(store, [
+      { content: 'User: 弄好了吗\nAssistant: 弄好了' },          // 空壳
+      { content: '代理端口 7890 的说明条目' },
+      { content: '代理端口 7890 的另一条说明' },
+    ]);
+    // 前两条给近乎相同的向量，第三条独立
+    store.setVector(ids[1], Float32Array.from([1, 0, 0, 0, 0, 0, 0, 0]), 'fake');
+    store.setVector(ids[2], Float32Array.from([0.999, 0.01, 0, 0, 0, 0, 0, 0]), 'fake');
+
+    const out = tidyScan({ store });
+    assert.equal(out.ok, true);
+    assert.equal(out.summary.shells, 1);
+    assert.equal(out.summary.clusters, 1);
+    assert.equal(out.clusters[0].size, 2);
+    assert.ok(out.clusters[0].minScore >= 0.78);
+
+    // 锚点：未设置 → 全库；写入后能被读回来
+    assert.equal(readAnchor({ store }), '');
+    writeAnchor({ store, at: '2026-02-01T00:00:00.000Z' });
+    assert.equal(readAnchor({ store }), '2026-02-01T00:00:00.000Z');
+  } finally {
+    store.close();
+    cleanup();
   }
 });

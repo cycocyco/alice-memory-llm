@@ -1,5 +1,24 @@
 # 更新日志
 
+## 1.4.0 — 2026-11-13
+
+### 新增：整理记忆库的能力
+
+与主线 `alice-memory` v3.1.0 同一套实现（`lib/ops.mjs`、`lib/tidy.mjs`、`lib/store.mjs` 逐字节一致），只是捕捉入口不同。摘要如下，细节见 [TIDY.md](TIDY.md)。
+
+- **`alice_memory_tidy` 工具**：`scan` 出候选 / `list` 翻条目 / `delete` 按 id 批删 / `merge` 合并。默认只出 diff，`apply=true` 才落地。
+- **`lib/tidy.mjs`**：代码裁剪候选，模型裁决语义。重复检测走现成向量，余弦相似度 ≥ 0.78 连成簇；空壳只认确定性高的形态（手记、pinned、高重要度一律不碰）。
+- **增量窗口**：锚点存 `meta.tidy_anchor_at`，整理完自动推进，下次只看新增。
+- **CLI**：`list` / `tidy` / `merge` / `tidy-anchor`，`forget` 支持 `--ids`。
+
+### 变了：`forget --query` 不再命中即删
+
+关键词模糊匹配，命中即删在整理时最容易带走该留的那条。现在默认只返回命中清单，带 `confirm` 才真删；按 `id` / `ids` 删除不受影响。
+
+### 关于定时整理
+
+插件不做定时。要不要定期整理、报告投递到哪，都是使用者自己的事；`TIDY.md` 末尾有一份可直接喂给 agent 的任务说明。
+
 本仓库是 [alice-memory](https://github.com/cycocyco/alice-memory) 的 **LLM 提炼支线**，从主线 v3.0.0 派生，但**版本号独立**——从 `1.0.0` 起算，不再跟主线的数字对齐。
 
 主线继续走「逐条规则捕获、零模型调用」；本仓库把「什么值得记」交给主对话模型，代价是每次提炼一次模型调用。
