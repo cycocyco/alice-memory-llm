@@ -103,8 +103,8 @@ turn 11 [assistant]: ...
 ```
 
 - **热度不进 SQL。** 存 `heat0 / reinforced_at / half_life_days`，衰减在 JS 里现算。
-- **分层是硬约束。** `hot_max` 3000、`warm_max` 12000，超了按热度往下压。
-- **双阈值滞回。** hot 进 0.6 / 出 0.4，warm 进 0.3 / 出 0.15。
+- **分层是相对的，容量是绝对的。** 层按热度名次的分位切（top 20% = hot，接下来 30% = warm），`hot_ratio` / `warm_ratio` 随库规模自适应；热度跌破 `warm_out` 的另判 cold。**索引容量独立**：`index_capacity` 按热度取前 N 条常驻内存，与层无关，小库时所有记忆都在索引里。
+- **pinned 不参与容量竞争，但永不 cold。**
 - **只有真的被注入上下文才强化。** 候选集里没用上的不加热度。
 
 实测（Windows 11 / Node 26 / 1 万条 × 1024 维）：热区向量扫描 20–30ms、FTS5 约 3ms、端到端召回 289ms，大头是 embedding 网络往返（200–380ms）。

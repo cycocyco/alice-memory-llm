@@ -52,7 +52,10 @@
     "dedup": { "enabled": true, "near_dup": 0.9, "similar_floor": 0.75, "similar_max": 3 }
   },
   "memory": {
-    "_note": "分层容量是硬约束：只有 hot + warm 常驻内存参与每轮扫描，cold 留在磁盘上按需唤醒。",
+    "_note": "分层按热度名次的分位切，随库规模自适应（hot_ratio/warm_ratio）；index_capacity 独立控制常驻内存的条目数，与分层无关。",
+    "hot_ratio": 0.2,
+    "warm_ratio": 0.3,
+    "index_capacity": 15000,
     "hot_max": 3000,
     "warm_max": 12000,
     "half_life_days": 45,

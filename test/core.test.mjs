@@ -11,6 +11,8 @@ import { FakeEmbedder, hashVector } from '../lib/embedding.mjs';
 import { hybridSearch } from '../lib/search.mjs';
 import { isWorthKeeping, loadIndex } from '../lib/capture.mjs';
 import { recallForPrompt } from '../lib/recall.mjs';
+import { queryTerms } from '../lib/text.mjs';
+import { assignTiers } from '../lib/heat.mjs';
 import { remember, forget, prunePreview, pruneApply, listEntries, forgetMany, mergeMemories } from '../lib/ops.mjs';
 import { tidyScan, cosine, isShell, clusterBySimilarity, readAnchor, writeAnchor } from '../lib/tidy.mjs';
 import { localDate } from '../lib/text.mjs';
@@ -84,6 +86,59 @@ test('insert dedupes by content hash and lands in FTS', () => {
   } finally {
     store.close();
     cleanup();
+  }
+});
+
+test('queryTerms 丢掉问句脚手架词，保住内容词', () => {
+  assert.deepEqual(queryTerms('Python 的 GIL 是什么'), ['Python', 'GIL']);
+  assert.deepEqual(queryTerms('这个项目怎么构建'), ['这个项目怎么构建']);
+  assert.deepEqual(queryTerms('怎么样'), []);
+  // 标识符这类短而独特的词不能被当脚手架扔掉
+  assert.deepEqual(queryTerms('0x80070005 怎么解决'), ['0x80070005', '怎么解决']);
+});
+
+test('问句语法词不能伪造命中：正文含「是什么」不该被无关查询捞出来', () => {
+  const { dir, cleanup } = tmp();
+  const cfg = makeCfg(dir);
+  const store = openStore(dir, cfg);
+  try {
+    store.insertMemory({
+      content: '本项目确立间距规则：折叠块与相邻内容的间距取决于后一条是什么——后一条是折叠块则紧凑',
+      kind: 'note',
+      memoryCfg: cfg.memory,
+    });
+    // 「是什么」被滤掉后，剩下 Python / GIL 在全库无匹配 → 一条都不该返回
+    const hits = store.searchFts(queryTerms('Python 的 GIL 是什么'), 5);
+    assert.equal(hits.length, 0);
+  } finally {
+    store.close();
+    cleanup();
+  }
+});
+
+test('自适应分层：100 条也有 100 条的冷热，不按绝对容量', () => {
+  // 100 条记忆全部热度相近、全部原本 hot：旧逻辑 hot_max=3000 会让 100 条全留 hot
+  const items = Array.from({ length: 100 }, (_, i) => ({
+    id: `m${i}`,
+    heat: 3 - i * 0.01,
+    pinned: false,
+    prev: 'hot',
+  }));
+  const out = assignTiers(items, { hot_ratio: 0.2, warm_ratio: 0.3 });
+  const count = (t) => out.filter((x) => x.tier === t).length;
+  assert.equal(count('hot'), 20);
+  assert.equal(count('warm'), 30);
+  assert.equal(count('cold'), 50);
+});
+
+test('自适应分层随库规模缩放：10 条和 1000 条都切出同样的比例', () => {
+  const mk = (n) => Array.from({ length: n }, (_, i) => ({
+    id: `m${i}`, heat: 3 - (i * 3) / n, pinned: false, prev: 'hot',
+  }));
+  for (const n of [10, 1000]) {
+    const out = assignTiers(mk(n), { hot_ratio: 0.2, warm_ratio: 0.3 });
+    const hot = out.filter((x) => x.tier === 'hot').length;
+    assert.ok(Math.abs(hot - n * 0.2) <= 1, `${n} 条的 hot 数 ${hot} 偏离 20%`);
   }
 });
 
