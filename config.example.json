@@ -47,6 +47,8 @@
     "idleMs": 600000,
     "model": "inherit",
     "maxDailyExtractions": 50,
+    "max_tokens": 0,
+    "max_turns_per_extract": 0,
     "embed_retry_minutes": 5,
     "max_turn_chars": { "user": 500, "assistant": 200 },
     "dedup": { "enabled": true, "near_dup": 0.9, "similar_floor": 0.75, "similar_max": 3 }
