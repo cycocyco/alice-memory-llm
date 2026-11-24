@@ -1,5 +1,22 @@
 # 更新日志
 
+## 1.5.2 — 2026-11-24
+
+### 修了：换 embedding 模型后向量静默失效
+
+模型换了、维度恰好还是 1024 时，旧向量会被当成合格数据参与相似度计算——两个不同向量空间算出来的余弦全是噪声，而这个「不匹配」用维度根本发现不了。表现是召回悄悄退化成纯关键词，日志里一句提示都没有。
+
+- `vectorsFor` / `allVectors` 只认当前 `model` + `dimensions` 的向量。
+- 启动时检测到别的模型建的向量，把这些记忆打回 `pending` 并排队用当前模型重嵌（向量按 `memory_id` 覆盖，不留垃圾）。
+
+### 修了：原生 HTTP 请求不带 content-length，慢 50 倍
+
+`req.write(body)` 不给长度时 Node 自动走 chunked，对方网关对分块上传的处理极慢：同一个 embedding 接口实测 **chunked 9.9s / 带长度 0.2s**。慢到必然撞上 embedding 的 3.5s 超时，表现为「向量永远生成不出来」。
+
+现在显式写入 `content-length`；同时禁用连接复用（`agent: false` + `connection: close`）——跨境 TLS 链路上踩到被对端静默丢弃的 keep-alive socket，会等几十秒后报 ECONNRESET。
+
+提炼请求走同一个 transport，同样受益。
+
 ## 1.5.1 — 2026-11-24
 
 ### 变了：提炼提示词瘦身，输出更短
