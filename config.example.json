@@ -10,7 +10,9 @@
     "maxDailyExtractions 是每天最多调几次模型（失败也算一次）。这三个都会直接决定花多少钱。",
     "max_turn_chars 截断入池原文（user/assistant 分角色），dedup 在入库前做向量判重，",
     "近重复与同话题超量（similar_max）都不进库——省的是提炼 prompt 的 token，参考块整个不发了。",
-    "注意：dedup 依赖向量，embedding 没配时判重整道闸放行（fail-open），不会拦任何条目。"
+    "注意：dedup 依赖向量，embedding 没配时判重整道闸放行（fail-open），不会拦任何条目。",
+    "recall.enabled 是三态：true 每轮注入；\"first\" 每会话只注入一次；false 关闭注入、全靠 agent 主动调 recall 工具。",
+    "search.query_max_chars 只截断「查询侧」的嵌入输入（默认 400 字），不影响入库正文。"
   ],
   "data_dir": "",
   "scope_id": "default",
@@ -31,11 +33,13 @@
     "vector_weight": 1.0,
     "lexical_weight": 0.35,
     "rrf_k": 60,
+    "query_max_chars": 400,
     "vector_budget_ms": 3000,
     "lexical_always": true
   },
   "recall": {
     "enabled": true,
+    "inject_reinforce_gain": 0,
     "limit": 3,
     "timeout_ms": 6000,
     "max_chars": 400,
@@ -69,8 +73,9 @@
     "warm_in": 0.3,
     "warm_out": 0.15,
     "reinforce_base": 1.0,
-    "reinforce_gain": 0.35,
-    "reinforce_cap": 3.0,
+    "reinforce_gain": 0.25,
+    "reinforce_cap": 6.0,
+    "tombstone_keep_days": 30,
     "sweep_hours": 6,
     "archive_after_days": 0,
     "prefer_worker": true

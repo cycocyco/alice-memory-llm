@@ -1,5 +1,13 @@
 # 更新日志
 
+## 1.6.1 — 2026-11-25
+
+### 补上示例配置里漏掉的新键
+
+1.6.0 发布的 `config.example.json` 里没有 `search.query_max_chars`、`recall.inject_reinforce_gain`、`memory.tombstone_keep_days` 三个新键，`reinforce_gain` / `reinforce_cap` 也还是旧值。只改文档与示例，代码无变化。
+
+---
+
 ## 1.6.0 — 2026-11-25
 
 ### 召回不再把自己烧成「人人都满分」
