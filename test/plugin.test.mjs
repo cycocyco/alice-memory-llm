@@ -49,6 +49,7 @@ test('plugin apply wires hooks and tools, extracts a batch on idle', async () =>
   const prevDir = process.env.ALICE_MEMORY_DATA_DIR;
   const prevHome = process.env.DSH_HOME;
   const prevKey = process.env.ALICE_MEMORY_API_KEY;
+  const prevCfg = process.env.ALICE_MEMORY_CONFIG;
   const gateway = await startFakeGateway([{
     content: '决定：给项目 README 补上安装说明和隐私声明',
     type: 'decision',
@@ -57,6 +58,9 @@ test('plugin apply wires hooks and tools, extracts a batch on idle', async () =>
   }]);
 
   process.env.ALICE_MEMORY_DATA_DIR = dir;
+  // 隔离本机 config.json：不隔离的话，开发机上的 base_url/model 会把提炼请求
+  // 直接发去真实网关，假网关收到 0 次调用，测试就变成了「看本机配置脸色」
+  process.env.ALICE_MEMORY_CONFIG = join(dir, 'no-local-config.json');
   // 断网：不给 embedding key，向量留 pending；提炼走本机假网关
   process.env.DSH_HOME = dir;
   process.env.ALICE_MEMORY_API_KEY = '';
@@ -145,6 +149,8 @@ test('plugin apply wires hooks and tools, extracts a batch on idle', async () =>
     else process.env.DSH_HOME = prevHome;
     if (prevKey === undefined) delete process.env.ALICE_MEMORY_API_KEY;
     else process.env.ALICE_MEMORY_API_KEY = prevKey;
+    if (prevCfg === undefined) delete process.env.ALICE_MEMORY_CONFIG;
+    else process.env.ALICE_MEMORY_CONFIG = prevCfg;
     gateway.server.close();
     await new Promise((r) => setTimeout(r, 100));
     // Windows 上临时目录偶尔报 EPERM（句柄释放比 unlink 慢一拍），两遍清 + 最终降级为警告

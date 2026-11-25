@@ -23,7 +23,7 @@ import { VectorIndex } from './lib/vector-index.mjs';
 import { HttpEmbedder } from './lib/embedding.mjs';
 import { loadIndex, runBackfill } from './lib/capture.mjs';
 import { recallForPrompt } from './lib/recall.mjs';
-import { remember, forget, prunePreview, pruneApply, listEntries, forgetMany, mergeMemories } from './lib/ops.mjs';
+import { remember, forget, prunePreview, pruneApply, listEntries, forgetMany, mergeMemories, setPinnedMany } from './lib/ops.mjs';
 import { tidyScan, writeAnchor } from './lib/tidy.mjs';
 import { createCapturePool } from './lib/pool.mjs';
 
@@ -63,6 +63,7 @@ export function apply(ctx, config) {
   });
 
   const injected = new Map();   // sessionId -> Set(ids) 本轮已注入
+  const injectedOnce = new Set(); // recall.enabled === 'first' 时，已注入过的会话
 
   let disposed = false;
   let sweeping = false;
@@ -83,6 +84,13 @@ export function apply(ctx, config) {
         loadIndex({ store, index, cfg, logger });
       }
       if (out.changed) logger.info(`sweep: ${out.changed}/${out.scanned} rows moved tier`);
+      // 墓碑只用于「删掉的东西别再被重新捕捉」这一层记忆，留 30 天足够；
+      // 不回收就是只涨不降（实测 53 条活条目配了 598 个墓碑）
+      const keepDays = Number(cfg.memory?.tombstone_keep_days ?? 30);
+      if (keepDays > 0) {
+        const pruned = store.pruneTombstones(keepDays);
+        if (pruned) logger.info(`tombstones: pruned ${pruned} older than ${keepDays}d`);
+      }
     } catch (err) {
       logger.warn(`sweep failed: ${err?.message ?? err}`);
     } finally {
@@ -151,6 +159,12 @@ export function apply(ctx, config) {
       const prompt = extractText(userMessage?.content).trim();
       if (!prompt || REVOKE_PATTERN.test(prompt)) return decision;
 
+      // 注入三态：true = 每轮注入；'first' = 每个会话只注入一次；false/其它 = 关闭。
+      // 关闭时全靠我主动调 alice_memory_recall —— 安静，不每轮烧 token。
+      const mode = cfg.recall?.enabled;
+      if (mode !== true && mode !== 'first') return decision;
+      if (mode === 'first' && injectedOnce.has(sessionId)) return decision;
+
       const seen = injected.get(sessionId) ?? new Set();
       injected.set(sessionId, seen);
       if (injected.size > 64) injected.delete(injected.keys().next().value);
@@ -159,8 +173,14 @@ export function apply(ctx, config) {
         store, index, embedder, cfg, logger,
         query: prompt,
         excludeIds: seen,
+        // 每轮都「被看到」不等于被使用：注入路径不加温，否则热度会被自己刷到 cap
+        reinforceGain: Number(cfg.recall?.inject_reinforce_gain ?? 0),
       });
       if (!res.count) return decision;
+      if (mode === 'first') {
+        if (injectedOnce.size > 64) injectedOnce.delete(injectedOnce.values().next().value);
+        injectedOnce.add(sessionId);
+      }
       for (const item of res.items) seen.add(item.id);
 
       logger.info(`recall: ${res.count} items in ${res.timings?.total ?? 0}ms (${res.items.map((i) => i.via).join(',')})`);
@@ -207,6 +227,26 @@ export function apply(ctx, config) {
   // ---------- 3. 显式工具 ----------
   const textBlock = (text) => [{ type: 'text', text }];
 
+  // 召回诊断：降级（超时/嵌入失败）过去只写日志，人看不见，于是「召回不准」
+  // 永远只能靠猜。这里把关键计数和降级原因一起吐给调用方。
+  const int = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : 0);
+  const buildDiag = (res) => {
+    const t = res?.timings ?? {};
+    const c = res?.counts ?? {};
+    const notes = Array.isArray(res?.notes)
+      ? res.notes.filter((n) => typeof n === 'string').slice(0, 4)
+      : [];
+    return {
+      embed_ms: int(t.embed),
+      total_ms: int(t.total),
+      vector_hits: int(c.vector),
+      lexical_hits: int(c.lexical),
+      cold_hits: int(c.cold),
+      degraded: Boolean(res?.timedOut) || notes.length > 0,
+      notes,
+    };
+  };
+
   ctx.tools.register({
     name: 'alice_memory_save',
     description:
@@ -250,7 +290,8 @@ export function apply(ctx, config) {
   ctx.tools.register({
     name: 'alice_memory_recall',
     description:
-      '主动检索长期记忆。用户说「回忆一下」「之前那个」「你还记得吗」「翻一下记忆」时调用。',
+      '主动检索长期记忆。默认不走每轮自动注入（recall.enabled=false 时），记忆全靠这个工具按需取。' +
+      '当对话涉及用户的个人偏好、过往约定、历史项目背景、人名/专有名词，或用户提到「之前」「上次」「还记得吗」「回忆一下」「翻一下记忆」时，先调用本工具再作答；纯闲聊或当前上下文已自足时无需调用。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -258,6 +299,10 @@ export function apply(ctx, config) {
         query: { type: 'string', description: '检索用的问题或关键词，写具体一点。' },
         limit: { type: 'integer', description: '最多返回几条，默认 5。' },
         include_cold: { type: 'boolean', description: '是否强制补扫冷层（默认只在热区命中不足时扫）。' },
+        with_ids: {
+          type: 'boolean',
+          description: '附带每条命中的 id、分层、热度与得分，便于随后精确 forget 或 tidy。默认 false。',
+        },
       },
       required: ['query'],
     },
@@ -269,14 +314,66 @@ export function apply(ctx, config) {
           ok: { type: 'boolean' },
           count: { type: 'integer' },
           context: { type: 'string' },
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string' },
+                tier: { type: 'string' },
+                heat: { type: 'number' },
+                score: { type: 'number' },
+                via: { type: 'string' },
+                content: { type: 'string' },
+              },
+              required: ['id'],
+            },
+          },
           error: { type: 'string' },
+          diag: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              embed_ms: { type: 'integer' },
+              total_ms: { type: 'integer' },
+              vector_hits: { type: 'integer' },
+              lexical_hits: { type: 'integer' },
+              cold_hits: { type: 'integer' },
+              degraded: { type: 'boolean' },
+              notes: { type: 'array', items: { type: 'string' } },
+            },
+          },
         },
         required: ['ok'],
       },
       render(_args, v) {
         if (!v.ok) return textBlock(`检索失败：${v.error ?? '未知错误'}`);
         if (!v.count) return textBlock('没有命中的记忆。');
-        return textBlock(v.context ?? '');
+        let body = v.context ?? '';
+        if (Array.isArray(v.items) && v.items.length) {
+          const lines = v.items.map((i) => {
+            const bits = [i.id];
+            if (i.tier) bits.push(i.tier);
+            if (typeof i.heat === 'number') bits.push(`heat=${i.heat}`);
+            if (typeof i.score === 'number') bits.push(`score=${i.score}`);
+            if (i.via) bits.push(`via=${i.via}`);
+            return `· ${bits.join('  ')}`;
+          });
+          body += `\n\n【命中明细，可直接用于 forget / tidy】\n${lines.join('\n')}`;
+        }
+        const d = v.diag;
+        if (d) {
+          const bits = [`embed ${d.embed_ms ?? '?'}ms`, `总 ${d.total_ms ?? '?'}ms`];
+          bits.push(`向量 ${d.vector_hits ?? 0}`);
+          bits.push(`词法 ${d.lexical_hits ?? 0}`);
+          if (d.cold_hits) bits.push(`冷层 ${d.cold_hits}`);
+          if (d.degraded) bits.push('⚠ 已降级');
+          let diag = `\n\n【诊断】${bits.join(' · ')}`;
+          if (Array.isArray(d.notes) && d.notes.length) diag += `\n降级原因：${d.notes.join('；')}`;
+          body += diag;
+        }
+        return textBlock(body);
       },
     },
     async execute(args) {
@@ -288,7 +385,27 @@ export function apply(ctx, config) {
         query, limit,
         forceCold: args?.include_cold === true,
       });
-      return { ok: true, count: res.count, context: res.context };
+      const withIds = args?.with_ids === true;
+      // 注意：工具返回值必须能无损序列化。undefined 属性和 NaN/Infinity 都会被宿主的
+      // 序列化校验拒绝（报 "value is not lossless JSON"），所以字段要逐个断言后再放进去。
+      const out = {
+        ok: true,
+        count: Number.isFinite(Number(res.count)) ? Number(res.count) : 0,
+        context: typeof res.context === 'string' ? res.context : '',
+        diag: buildDiag(res),
+      };
+      if (withIds) {
+        out.items = (res.items ?? []).map((i) => {
+          const row = { id: String(i.id) };
+          if (i.tier != null) row.tier = String(i.tier);
+          if (Number.isFinite(Number(i.heat))) row.heat = Number(i.heat);
+          if (Number.isFinite(Number(i.score))) row.score = Number(i.score);
+          if (i.via != null) row.via = String(i.via);
+          if (i.content != null) row.content = String(i.content);
+          return row;
+        });
+      }
+      return out;
     },
   });
 
@@ -421,21 +538,25 @@ export function apply(ctx, config) {
     name: 'alice_memory_tidy',
     description:
       '整理长期记忆库。用户说「整理记忆」「清理记忆库」「合并重复的记忆」时用。' +
-      'action=scan 出候选（重复簇 / 空壳 / 久未用），action=delete 按 id 批删，action=merge 把多条并成一条新总结。' +
+      'action=stats 出库体检（分层分布、置顶比例、热度分位、向量状态）；' +
+      'action=scan 出候选（重复簇 / 空壳 / 久未用），action=delete 按 id 批删，action=merge 把多条并成一条新总结，' +
+      'action=pin 批量置顶/解除置顶（配 pinned:false 解除）。' +
       '默认只出 diff 不动手，确认后带 apply=true。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['scan', 'list', 'delete', 'merge'], description: '要做的事。' },
+        action: { type: 'string', enum: ['stats', 'scan', 'list', 'delete', 'merge', 'pin'], description: '要做的事。' },
         apply: { type: 'boolean', description: '真正落地；不传则只预览。' },
         ids: { type: 'array', items: { type: 'string' }, description: 'delete / merge 的目标 id。' },
         content: { type: 'string', description: 'merge 时新写的总结正文。' },
         since: { type: 'string', description: 'scan 的增量起点（ISO 时间）；缺省读上次整理的锚点。' },
         keyword: { type: 'string', description: 'list 时按关键词过滤。' },
         tier: { type: 'string', enum: ['hot', 'warm', 'cold', 'archive'], description: 'list 时按分层过滤。' },
+        pinned: { type: 'boolean', description: 'list 时只看置顶（true）或只看非置顶（false）；置顶占比过高时用它捞清单。' },
         limit: { type: 'integer', description: 'list 每页条数，默认 50。' },
         offset: { type: 'integer', description: 'list 翻页偏移。' },
+        full: { type: 'boolean', description: 'list 时输出完整正文而不是 120 字摘要（召回不可用时靠它取原文）。' },
         threshold: { type: 'number', description: 'scan 的自动合并阈值，默认 0.92。' },
         lower: { type: 'number', description: 'scan 的候选阈值，默认 0.78。' },
       },
@@ -463,13 +584,47 @@ export function apply(ctx, config) {
       const action = typeof args?.action === 'string' ? args.action : 'scan';
       const apply = args?.apply === true;
 
+      if (action === 'stats') {
+        const total = store.countAll();
+        const tiers = store.tierCounts();
+        const vecs = store.countVectors();
+        const pending = store.pending(1000).length;
+        const tombs = store.countTombstones();
+        const span = store.db.prepare('SELECT min(local_date) a, max(local_date) b FROM memories').get() ?? {};
+        const pinned = Number(store.db.prepare('SELECT count(*) n FROM memories WHERE pinned = 1').get()?.n ?? 0);
+        // 热度用「当前有效热度」，不是入库值；heatTopRows 已按热度降序
+        const rows = store.heatTopRows(1e9);
+        const heats = rows.map((r) => r.heat).filter((h) => Number.isFinite(h));
+        const q = (p) => (heats.length
+          ? heats[Math.min(heats.length - 1, Math.floor(p * (heats.length - 1)))].toFixed(2)
+          : '-');
+        const pct = (n) => (total ? Math.round((n / total) * 100) : 0);
+        const lines = [];
+        lines.push(`总量 ${total} 条 · 向量 ${vecs}（pending ${pending}）· 墓碑 ${tombs}`);
+        lines.push(
+          `分层 hot ${tiers.hot ?? 0} / warm ${tiers.warm ?? 0} / cold ${tiers.cold ?? 0} / archive ${tiers.archive ?? 0}`,
+        );
+        lines.push(
+          `目标比例 hot ${Math.round(Number(cfg.memory?.hot_ratio ?? 0.2) * 100)}%`
+          + ` / warm ${Math.round(Number(cfg.memory?.warm_ratio ?? 0.3) * 100)}%`
+          + `（按热度名次切，随库规模自适应）`,
+        );
+        lines.push(`置顶 ${pinned} 条（${pct(pinned)}%）`);
+        if (total >= 20 && pct(pinned) > 20) lines.push('⚠ 置顶占比偏高，置顶不参与分层竞争，建议精简。');
+        lines.push(`热度 p50 ${q(0.5)} · p90 ${q(0.1)} · 最低 ${q(1)}`);
+        lines.push(`索引容量 ${cfg.memory?.index_capacity ?? '-'} · 时间跨度 ${span.a ?? '-'} → ${span.b ?? '-'}`);
+        return { ok: true, action, applied: false, summary: lines.join('\n') };
+      }
+
       if (action === 'list') {
         const out = listEntries({
           store,
           keyword: typeof args?.keyword === 'string' ? args.keyword : '',
           tier: typeof args?.tier === 'string' ? args.tier : '',
+          pinned: typeof args?.pinned === 'boolean' ? args.pinned : null,
           limit: Number.isInteger(args?.limit) ? args.limit : 50,
           offset: Number.isInteger(args?.offset) ? args.offset : 0,
+          full: args?.full === true,
         });
         const body = out.items
           .map((i) => `· ${i.id} [${i.date}]${i.pinned ? ' 📌' : ''} ${i.content}`)
@@ -566,6 +721,34 @@ export function apply(ctx, config) {
           action,
           applied: true,
           summary: `合并完成：新条目 ${out.id}，删掉 ${out.removed} 条源条目${out.vector ? '，向量已生成' : '，向量待补'}。`,
+        };
+      }
+
+      if (action === 'pin') {
+        const ids = Array.isArray(args?.ids) ? args.ids.filter((x) => typeof x === 'string') : [];
+        if (!ids.length) return { ok: false, error: 'pin 需要 ids' };
+        const target = args?.pinned !== false; // 默认置顶，显式 pinned:false 才是解除
+        if (!apply) {
+          const found = ids.map((id) => store.getMemory(id)).filter(Boolean);
+          const body = found
+            .map((r) => `· ${r.id} [${r.local_date}] ${target ? '将置顶' : '将解除置顶'} ${String(r.content).slice(0, 60)}`)
+            .join('\n');
+          return {
+            ok: true,
+            action,
+            applied: false,
+            summary: found.length
+              ? `将${target ? '置顶' : '解除置顶'} ${found.length} 条（还没动）：\n${body}\n\n确认后带 apply=true。`
+              : '这些 id 在库里都不存在。',
+          };
+        }
+        const out = setPinnedMany({ store, ids, pinned: target });
+        return {
+          ok: true,
+          action,
+          applied: true,
+          summary: `已${target ? '置顶' : '解除置顶'} ${out.changed.length} 条`
+            + `${out.skipped.length ? `，${out.skipped.length} 条 id 不存在` : ''}。`,
         };
       }
 
