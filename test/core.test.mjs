@@ -625,3 +625,37 @@ test('tidyScan separates auto tier from candidate tier', () => {
     cleanup();
   }
 });
+
+test('未配置 embedding 时不得把整库向量判成「别家模型」', () => {
+  const { dir, cleanup } = tmp();
+  try {
+    const s1 = new Store({ dataDir: dir, dimensions: 1024, model: 'qwen-ish', scopeId: 'default' });
+    const { id } = s1.insertMemory({
+      occurredAt: new Date().toISOString(),
+      localDate: localDate(new Date()),
+      kind: 'note',
+      userText: '未配置时不应误判',
+      assistantText: '',
+      content: '未配置时不应误判',
+      sessionId: null,
+      scopeId: 'default',
+      source: 'manual',
+      embeddingStatus: 'ok',
+    });
+    s1.setVector(id, hashVector('未配置时不应误判', 1024));
+    s1.close();
+
+    // model 为空 = 没配 embedding：不能把「没配」当成「换了模型」，否则整库打回 pending
+    const s2 = new Store({ dataDir: dir, dimensions: 1024, model: '', scopeId: 'default' });
+    assert.equal(s2.countVectors(), 1);
+    assert.equal(s2.db.prepare("SELECT count(*) AS n FROM memories WHERE embedding_status = 'pending'").get().n, 0);
+    s2.close();
+
+    // 真换了模型才该打回 pending 重嵌
+    const s3 = new Store({ dataDir: dir, dimensions: 1024, model: 'other-model', scopeId: 'default' });
+    assert.equal(s3.db.prepare("SELECT count(*) AS n FROM memories WHERE embedding_status = 'pending'").get().n, 1);
+    s3.close();
+  } finally {
+    cleanup();
+  }
+});
