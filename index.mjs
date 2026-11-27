@@ -26,6 +26,7 @@ import { recallForPrompt } from './lib/recall.mjs';
 import { remember, forget, prunePreview, pruneApply, listEntries, forgetMany, mergeMemories, setPinnedMany } from './lib/ops.mjs';
 import { tidyScan, writeAnchor } from './lib/tidy.mjs';
 import { createCapturePool } from './lib/pool.mjs';
+import { statOf, STAT_KEYS } from './lib/extraction-store.mjs';
 
 export const name = 'alice-memory-llm';
 export const inject = ['tools'];
@@ -43,6 +44,26 @@ function extractText(content) {
       .join('\n');
   }
   return '';
+}
+
+/** 热索引成员集合是否与期望一致：逐条查 id，最多 capacity 次 Map 命中 */
+export function sameMembers(index, ids) {
+  if (typeof index?.size !== 'number') return false;
+  if (index.size !== ids.length) return false;
+  for (const id of ids) if (!index.get(id)) return false;
+  return true;
+}
+
+// 首轮注入名额很宝贵：一句「好的」「继续」不该把它烧掉。这里只拦「纯应答/极短」
+// 两类形式噪声，不碰实质输入（「接着上次那个」六个字是实质输入，必须放过）。
+const PROMPT_MIN_CHARS = 6;
+const PURE_ACK = /^(?:好|好的|好嘞|好吧|嗯|嗯嗯|哦|可以|行|收到|明白|明白了|ok|okay|继续|接着|下一步|然后呢|谢谢|多谢|辛苦|辛苦了|麻烦|麻烦了|在吗|在不|早|晚安|测试|测试一下)[\s!！。.~～?？,，、吧呀啊呢了的一下]*$/i;
+
+export function isSubstantivePrompt(text) {
+  const t = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (t.length < PROMPT_MIN_CHARS) return false;
+  return !PURE_ACK.test(t);
 }
 
 export function apply(ctx, config) {
@@ -79,9 +100,18 @@ export function apply(ctx, config) {
         if (orphans) logger.warn(`removed ${orphans} orphan vectors`);
       }
       if (out.changed) {
-        // tier 变了就得整体重建，逐条改索引会慢 100 倍
-        index.clear();
-        loadIndex({ store, index, cfg, logger });
+        // 热索引装的是「按热度取前 N 条」，与 tier 是两件事：库总量还没超过
+        // index_capacity 时，tier 怎么变成员都不会变，这里就不该重建。
+        // 只有成员集合真的变了（有条目挤进/挤出 top-N）才整体重灌。
+        const capacity = Number(
+          cfg.memory?.index_capacity
+            ?? (Number(cfg.memory?.hot_max ?? 3000) + Number(cfg.memory?.warm_max ?? 12000)),
+        );
+        const expected = store.heatTopRows(capacity).map((r) => r.id);
+        if (!sameMembers(index, expected)) {
+          index.clear();
+          loadIndex({ store, index, cfg, logger });
+        }
       }
       if (out.changed) logger.info(`sweep: ${out.changed}/${out.scanned} rows moved tier`);
       // 墓碑只用于「删掉的东西别再被重新捕捉」这一层记忆，留 30 天足够；
@@ -158,6 +188,8 @@ export function apply(ctx, config) {
       );
       const prompt = extractText(userMessage?.content).trim();
       if (!prompt || REVOKE_PATTERN.test(prompt)) return decision;
+      // 形式噪声直接跳过：既不进 seen，也不写 injectedOnce —— 名额留到第一句实质输入
+      if (!isSubstantivePrompt(prompt)) return decision;
 
       // 注入三态：true = 每轮注入；'first' = 每个会话只注入一次；false/其它 = 关闭。
       // 关闭时全靠我主动调 alice_memory_recall —— 安静，不每轮烧 token。
@@ -540,13 +572,14 @@ export function apply(ctx, config) {
       '整理长期记忆库。用户说「整理记忆」「清理记忆库」「合并重复的记忆」时用。' +
       'action=stats 出库体检（分层分布、置顶比例、热度分位、向量状态）；' +
       'action=scan 出候选（重复簇 / 空壳 / 久未用），action=delete 按 id 批删，action=merge 把多条并成一条新总结，' +
-      'action=pin 批量置顶/解除置顶（配 pinned:false 解除）。' +
+      'action=pin 批量置顶/解除置顶（配 pinned:false 解除）；' +
+      'action=extract-preview 只拼出下一次提炼的完整 prompt、不调模型（改提示词前后核对用，不烧额度）。' +
       '默认只出 diff 不动手，确认后带 apply=true。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['stats', 'scan', 'list', 'delete', 'merge', 'pin'], description: '要做的事。' },
+        action: { type: 'string', enum: ['stats', 'scan', 'list', 'delete', 'merge', 'pin', 'extract-preview'], description: '要做的事。' },
         apply: { type: 'boolean', description: '真正落地；不传则只预览。' },
         ids: { type: 'array', items: { type: 'string' }, description: 'delete / merge 的目标 id。' },
         content: { type: 'string', description: 'merge 时新写的总结正文。' },
@@ -613,7 +646,29 @@ export function apply(ctx, config) {
         if (total >= 20 && pct(pinned) > 20) lines.push('⚠ 置顶占比偏高，置顶不参与分层竞争，建议精简。');
         lines.push(`热度 p50 ${q(0.5)} · p90 ${q(0.1)} · 最低 ${q(1)}`);
         lines.push(`索引容量 ${cfg.memory?.index_capacity ?? '-'} · 时间跨度 ${span.a ?? '-'} → ${span.b ?? '-'}`);
+        // 提炼管线：过去只能看日志，出问题只会在库里静默变少
+        const lastAt = String(store.meta(STAT_KEYS.lastAt) ?? '').replace('T', ' ').slice(0, 19);
+        lines.push(
+          `提炼 最近 ${statOf(store, STAT_KEYS.lastMs)}ms / ${statOf(store, STAT_KEYS.lastItems)} 条`
+          + `${lastAt ? ` @ ${lastAt}` : ''} · 失败 ${statOf(store, STAT_KEYS.totalFailed)}`,
+        );
+        lines.push(
+          `判重 累计丢 ${statOf(store, STAT_KEYS.totalDropped)} · 软覆盖 ${statOf(store, STAT_KEYS.totalSuperseded)}`
+          + ` · 积压丢弃 ${statOf(store, STAT_KEYS.backlogDropped)}`,
+        );
+        const supersededRows = Number(
+          store.db.prepare('SELECT count(*) n FROM memories WHERE superseded_by IS NOT NULL').get()?.n ?? 0,
+        );
+        if (supersededRows) lines.push(`被覆盖（不再召回）${supersededRows} 条，正文保留可回滚`);
         return { ok: true, action, applied: false, summary: lines.join('\n') };
+      }
+
+      if (action === 'extract-preview') {
+        const pv = pool.previewPrompt();
+        const head = pv.turns
+          ? `待提炼 ${pv.turns} 轮 · 池内 ${pv.pending} 条消息 · system ${pv.systemChars} 字 + user ${pv.userChars} 字 ≈ ${pv.estTokens} token`
+          : `池内 ${pv.pending} 条消息，暂无已完成轮次`;
+        return { ok: true, action, applied: false, summary: `${head}\n\n${pv.text}` };
       }
 
       if (action === 'list') {

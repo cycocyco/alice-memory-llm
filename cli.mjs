@@ -15,7 +15,7 @@ import { runBackfill, loadIndex } from './lib/capture.mjs';
 import { remember, forget, prunePreview, pruneApply, listEntries, mergeMemories } from './lib/ops.mjs';
 import { tidyScan, readAnchor, writeAnchor } from './lib/tidy.mjs';
 import { localDate } from './lib/text.mjs';
-import { ensureExtractionSchema } from './lib/extraction-store.mjs';
+import { ensureExtractionSchema, statOf, STAT_KEYS } from './lib/extraction-store.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -120,6 +120,14 @@ async function main() {
         store.db.prepare("SELECT count(*) AS n FROM memories WHERE source = 'extracted'").get()?.n ?? 0,
       );
       console.log(`extract    cursor ${cursorRow ?? '(none yet, first idle trigger pending)'}  |  today ${usedToday}/${cfg.capture.maxDailyExtractions}  |  entries ${extracted}`);
+      // 管线可观测：耗时、判重丢弃、软覆盖、积压丢弃都落在 meta 里，出问题不再只靠翻日志
+      const lastAt = String(store.meta(STAT_KEYS.lastAt) ?? '').replace('T', ' ').slice(0, 19);
+      console.log(
+        `  last     ${statOf(store, STAT_KEYS.lastMs)}ms / ${statOf(store, STAT_KEYS.lastItems)} 条`
+        + `${lastAt ? ` @ ${lastAt}` : ''}  |  failed ${statOf(store, STAT_KEYS.totalFailed)}`
+        + `  |  dedup -${statOf(store, STAT_KEYS.totalDropped)}  superseded ${statOf(store, STAT_KEYS.totalSuperseded)}`
+        + `  |  backlog dropped ${statOf(store, STAT_KEYS.backlogDropped)}`,
+      );
       return;
     }
 

@@ -17,6 +17,8 @@ import {
   ensureExtractionSchema, cursor, dailyExtractions, commitExtraction,
 } from '../lib/extraction-store.mjs';
 import { createCapturePool } from '../lib/pool.mjs';
+import { isValueUpdate, markersOf } from '../lib/dedup.mjs';
+import { isSubstantivePrompt, sameMembers } from '../index.mjs';
 
 function tmp() {
   const dir = mkdtempSync(join(tmpdir(), 'alice-extract-'));
@@ -294,13 +296,58 @@ test('buildPrompt 只含原文与约束，已有记忆参考块不再进提示�
   const [system, user] = buildPrompt({
     turns: [{ turnId: 11, role: 'user', text: '我以后都用 TypeScript' }],
   });
+  // 固定规则全部落在 system：动态 turns 只进 user，跨请求的前缀才恒定，
+  // 本地 llama.cpp 才能命中 KV / Prefix Cache（2 核机器上 prefill 是主要开销）
   assert.match(system.content, /只依据/);
   assert.match(system.content, /向量判重/);
+  assert.match(system.content, /【禁止提取清单】/);
+  assert.match(system.content, /\[\]/);
+  assert.doesNotMatch(system.content, /【已有记忆/);
   assert.match(user.content, /【本次待提炼的对话原文】/);
-  assert.match(user.content, /【禁止提取清单】/);
-  assert.doesNotMatch(user.content, /【已有记忆/);
   assert.match(user.content, /turn 11/);
-  assert.match(user.content, /\[\]/);
+  assert.doesNotMatch(user.content, /【禁止提取清单】/);
+});
+
+test('高相似时按「值标记」区分软覆盖与重复', () => {
+  // 取值变了 → 更新（老条目被软覆盖）；取值一字不差 → 真重复
+  assert.equal(
+    isValueUpdate({ oldText: '本项目统一用 Tab 缩进', newText: '本项目统一用 2 空格缩进', score: 0.86 }),
+    true,
+  );
+  assert.equal(
+    isValueUpdate({ oldText: '本机代理 7890', newText: '本机代理 7897', score: 0.83 }),
+    true,
+  );
+  assert.equal(
+    isValueUpdate({ oldText: '本机代理 7890', newText: '本机代理 7890', score: 0.99 }),
+    false,
+  );
+  // 0.78~0.9 灰区必须有话题词交集，否则宁可当重复也不误覆盖
+  assert.equal(
+    isValueUpdate({ oldText: '用户偏好原生组件', newText: '用户偏好先实测再优化', score: 0.8 }),
+    false,
+  );
+  assert.equal(isValueUpdate({ oldText: '', newText: '任何内容', score: 0.99 }), false);
+  assert.notEqual(markersOf('本项目统一用 Tab 缩进'), markersOf('本项目统一用 2 空格缩进'));
+});
+
+test('首轮注入名额保护：形式噪声不占名额，实质短输入要放过', () => {
+  for (const t of ['好的', '继续', 'OK', '嗯嗯', '谢谢', '在吗', '好嘞～', '  ']) {
+    assert.equal(isSubstantivePrompt(t), false, t);
+  }
+  for (const t of ['接着上次那个', '把 min_score 改成 0.45', '重启一下后端']) {
+    assert.equal(isSubstantivePrompt(t), true, t);
+  }
+});
+
+test('热索引成员集未变时不重建索引', () => {
+  const vec = new Float32Array(4).fill(0.5);
+  const index = new VectorIndex(4, { preferWorker: false });
+  index.set('a', vec);
+  index.set('b', vec);
+  assert.equal(sameMembers(index, ['a', 'b']), true);
+  assert.equal(sameMembers(index, ['a', 'c']), false);
+  assert.equal(sameMembers(index, ['a']), false);
 });
 
 // ---------- 入池截断：助手长回复与长贴日志不再整段进提炼 prompt ----------
