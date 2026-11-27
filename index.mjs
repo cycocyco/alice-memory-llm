@@ -86,6 +86,22 @@ export function apply(ctx, config) {
   const injected = new Map();   // sessionId -> Set(ids) 本轮已注入
   const injectedOnce = new Set(); // recall.enabled === 'first' 时，已注入过的会话
 
+  /**
+   * 钉住的条目前 N 条，只在「一次注入」那一轮随行。
+   * 做成每轮都塞会打断主对话自己的 KV 前缀缓存 —— 慢机器上是纯亏。
+   */
+  const pinnedContext = (exclude = new Set()) => {
+    try {
+      const out = listEntries({ store, pinned: true, limit: 8, full: true });
+      const rows = (out.items ?? []).filter((i) => !exclude.has(i.id));
+      if (!rows.length) return null;
+      return [rows.length, ['【钉住的规矩】', ...rows.map((i) => `- ${i.content}`)].join('\n')];
+    } catch (err) {
+      logger.warn(`pinned context failed: ${err?.message ?? err}`);
+      return null;
+    }
+  };
+
   let disposed = false;
   let sweeping = false;
 
@@ -208,21 +224,28 @@ export function apply(ctx, config) {
         // 每轮都「被看到」不等于被使用：注入路径不加温，否则热度会被自己刷到 cap
         reinforceGain: Number(cfg.recall?.inject_reinforce_gain ?? 0),
       });
-      if (!res.count) return decision;
+      const pinnedLines = mode === 'first' ? pinnedContext(new Set(res.items.map((i) => i.id))) : null;
+      if (!res.count && !pinnedLines) return decision;
       if (mode === 'first') {
         if (injectedOnce.size > 64) injectedOnce.delete(injectedOnce.values().next().value);
         injectedOnce.add(sessionId);
       }
       for (const item of res.items) seen.add(item.id);
 
-      logger.info(`recall: ${res.count} items in ${res.timings?.total ?? 0}ms (${res.items.map((i) => i.via).join(',')})`);
+      logger.info(
+        `recall: ${res.count} items in ${res.timings?.total ?? 0}ms (${res.items.map((i) => i.via).join(',')})`
+        + `${pinnedLines?.[0] ? ` + ${pinnedLines[0]} pinned` : ''}`,
+      );
+
+      // 钉住的规矩只在「一次注入」那一轮随行：每轮都塞会打断主对话自己的 KV 前缀缓存
+      const context = [pinnedLines?.[1], res.context].filter(Boolean).join('\n\n');
 
       const block = {
         id: randomUUID(),
         role: 'user',
         content: [{
           type: 'text',
-          text: `[alice-memory-llm: recall]\n${res.context}\n(reference only — fold in naturally if relevant)`,
+          text: `[alice-memory-llm: recall]\n${context}\n(reference only — fold in naturally if relevant)`,
         }],
         source: SOURCE,
       };
