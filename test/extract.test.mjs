@@ -331,9 +331,13 @@ test('高相似时按「值标记」区分软覆盖与重复', () => {
   assert.notEqual(markersOf('本项目统一用 Tab 缩进'), markersOf('本项目统一用 2 空格缩进'));
 });
 
-test('首轮注入名额保护：形式噪声不占名额，实质短输入要放过', () => {
-  for (const t of ['好的', '继续', 'OK', '嗯嗯', '谢谢', '在吗', '好嘞～', '  ']) {
+test('首轮注入名额保护：≤4 字默认拦，检索白名单放行', () => {
+  for (const t of ['好的', '继续', 'OK', '嗯嗯', '谢谢', '在吗', '好嘞～', '再改一次', '  ']) {
     assert.equal(isSubstantivePrompt(t), false, t);
+  }
+  // 短句里点名要记忆的必须放过：回忆 / 想想 / 想一下 / 记得 / 上次 / 之前
+  for (const t of ['回忆', '想想', '想一下', '记得', '上次', '之前']) {
+    assert.equal(isSubstantivePrompt(t), true, t);
   }
   for (const t of ['接着上次那个', '把 min_score 改成 0.45', '重启一下后端']) {
     assert.equal(isSubstantivePrompt(t), true, t);
@@ -408,11 +412,11 @@ test('启动即 WAL + busy_timeout=5000', () => {
 
 // ---------- 粗筛：必留规则 ----------
 
-test('粗筛保留必留规则，移除激进长度闸门', () => {
+test('粗筛按长度兜长尾，只留命令与自产块的确定性规则', () => {
   const cfg = makeCfg('x');
   const skip = [
-    ['', 'empty text'], ['嗯', 'too short'], ['好的！', 'filler'], ['谢谢', 'too short'],
-    ['okay', 'filler'],
+    ['', 'empty text'], ['嗯', 'too short'], ['好的！', 'too short'], ['谢谢', 'too short'],
+    ['okay', 'too short'], ['再改一次', 'too short'], ['那这个呢', 'too short'],
     ['/help', 'slash command'], ['/记忆撤销', 'revoke command'],
     ['？？？', 'no words'], ['😀😀', 'no words'],
     ['[alice-memory: recall] 内容', 'our own recall block'],
@@ -422,8 +426,8 @@ test('粗筛保留必留规则，移除激进长度闸门', () => {
     assert.equal(isWorthKeeping({ text, cfg }).keep, false, `${text} → ${reason}`);
     assert.equal(isWorthKeeping({ text, cfg }).reason, reason);
   }
-  assert.equal(isWorthKeeping({ text: '那这个呢', cfg }).keep, true, '短追问交给 LLM 裁决');
   assert.equal(isWorthKeeping({ text: '帮我看一下这个', cfg }).keep, true);
+  assert.equal(isWorthKeeping({ text: '改成 0.75 吧', cfg }).keep, true);
   const off = makeCfg('x', { capture: { enabled: false } });
   assert.equal(isWorthKeeping({ text: '一条很有价值的内容', cfg: off }).reason, 'capture disabled');
 });

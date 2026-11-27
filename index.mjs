@@ -54,16 +54,21 @@ export function sameMembers(index, ids) {
   return true;
 }
 
-// 首轮注入名额很宝贵：一句「好的」「继续」不该把它烧掉。这里只拦「纯应答/极短」
-// 两类形式噪声，不碰实质输入（「接着上次那个」六个字是实质输入，必须放过）。
-const PROMPT_MIN_CHARS = 6;
+// 首轮注入名额很宝贵：一句「好的」「继续」不该把它烧掉。
+// 判定按「去标点后的实字」算：≤4 字默认直接拦，只放行极简检索白名单
+// （回忆 / 想想 / 记得 / 上次 / 之前）——那些短句恰恰是在点名要记忆。
+// PURE_ACK 留作兜底，管住「好的呀～」这种稍长水词。
+const RECALL_MIN_CHARS = 5;
+const RECALL_SHORT_WHITELIST = /(?:回忆|想想|想一下|记得|上次|之前)/;
 const PURE_ACK = /^(?:好|好的|好嘞|好吧|嗯|嗯嗯|哦|可以|行|收到|明白|明白了|ok|okay|继续|接着|下一步|然后呢|谢谢|多谢|辛苦|辛苦了|麻烦|麻烦了|在吗|在不|早|晚安|测试|测试一下)[\s!！。.~～?？,，、吧呀啊呢了的一下]*$/i;
 
 export function isSubstantivePrompt(text) {
   const t = String(text ?? '').replace(/\s+/g, ' ').trim();
   if (!t) return false;
-  if (t.length < PROMPT_MIN_CHARS) return false;
-  return !PURE_ACK.test(t);
+  if (PURE_ACK.test(t)) return false;
+  const core = t.replace(/^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu, '');
+  if (core.length < RECALL_MIN_CHARS) return RECALL_SHORT_WHITELIST.test(core);
+  return true;
 }
 
 export function apply(ctx, config) {

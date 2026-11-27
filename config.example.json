@@ -56,7 +56,7 @@
     "embed_retry_minutes": 5,
     "max_turn_chars": { "user": 500, "assistant": 200 },
     "backlog_ttl_days": 7,
-    "dedup": { "enabled": true, "near_dup": 0.9, "similar_floor": 0.75, "similar_max": 5 }
+    "dedup": { "enabled": true, "near_dup": 0.9, "supersede_floor": 0.75, "similar_floor": 0.75, "similar_max": 5 }
   },
   "memory": {
     "_note": "分层容量是硬约束：只有 hot + warm 常驻内存参与每轮扫描，cold 留在磁盘上按需唤醒。",

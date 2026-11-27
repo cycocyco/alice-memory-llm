@@ -187,7 +187,10 @@ test('capture 粗筛只拦形式噪声，内容价值交给 LLM 裁决', () => {
     isWorthKeeping({ text: '帮我把这个视频按照两遍码率压一下，目标 500MB 以内', cfg }).keep,
     true,
   );
-  assert.equal(isWorthKeeping({ text: '那这个呢', cfg }).keep, true, '短追问不再被长度闸门误伤');
+  // 长度闸门按「去标点后的实字」算：≤4 字直接不进池（黑名单维护不动长尾，用长度兜）
+  assert.equal(isWorthKeeping({ text: '那这个呢', cfg }).keep, false, '≤4 字不进池');
+  assert.equal(isWorthKeeping({ text: '再改一次', cfg }).keep, false, '≤4 字不进池');
+  assert.equal(isWorthKeeping({ text: '那这个怎么改呢', cfg }).keep, true, '5 字以上交给 LLM 裁决');
 });
 
 test('手动 remember 绕过粗筛，直接写入并 pinned', async () => {
